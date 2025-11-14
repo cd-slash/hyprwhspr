@@ -7,6 +7,8 @@ import os
 import numpy as np
 import shutil
 import threading
+import wave
+from io import BytesIO
 from typing import Optional
 
 try:
@@ -40,37 +42,66 @@ class WhisperManager:
         """Initialize the whisper manager and check dependencies"""
         try:
             self.temp_dir = self.config.get_temp_directory()
-            
-            # Detect GPU backend for logging
-            gpu_backend = self._detect_gpu_backend()
 
-            try:
-                from pywhispercpp.model import Model
+            # Check which backend is configured
+            backend = self.config.get_setting('transcription_backend', 'local')
 
-                print(f"[pywhispercpp] Initializing model: {self.current_model}")
-                print(f"[pywhispercpp] Detected GPU backend: {gpu_backend}")
+            if backend == 'remote':
+                # Validate REST configuration
+                endpoint_url = self.config.get_setting('rest_endpoint_url')
 
-                self._pywhisper_model = Model(
-                    model=self.current_model,
-                    n_threads=self.config.get_setting('threads', 4),
-                    redirect_whispercpp_logs_to=None
-                )
+                if not endpoint_url:
+                    print("ERROR: REST backend selected but rest_endpoint_url not configured")
+                    return False
 
-                print("[pywhispercpp] Model loaded successfully", flush=True)
-                print(f"[BACKEND] Using pywhispercpp (in-process) with {gpu_backend} acceleration", flush=True)
-                import sys
-                sys.stdout.flush()
-                sys.stderr.flush()
+                # Validate URL is HTTPS (for security)
+                if not endpoint_url.startswith('https://') and not endpoint_url.startswith('http://'):
+                    print(f"WARNING: REST endpoint URL should start with https:// or http://: {endpoint_url}")
+
+                # Validate timeout is reasonable
+                timeout = self.config.get_setting('rest_timeout', 30)
+                if timeout < 1 or timeout > 300:
+                    print(f"WARNING: REST timeout should be between 1-300 seconds, got {timeout}")
+
+                print(f"[BACKEND] Using remote REST API: {endpoint_url}")
+                print(f"[REST] Timeout configured: {timeout}s")
+
+                # Mark as ready for REST mode
                 self.ready = True
                 return True
 
-            except ImportError as e:
-                print(f"[pywhispercpp] Import failed: {e}")
-                return False
-            except Exception as e:
-                print(f"[pywhispercpp] Initialization failed: {e}")
-                return False
-            
+            else:
+                # Initialize local pywhispercpp backend
+                # Detect GPU backend for logging
+                gpu_backend = self._detect_gpu_backend()
+
+                try:
+                    from pywhispercpp.model import Model
+
+                    print(f"[pywhispercpp] Initializing model: {self.current_model}")
+                    print(f"[pywhispercpp] Detected GPU backend: {gpu_backend}")
+
+                    self._pywhisper_model = Model(
+                        model=self.current_model,
+                        n_threads=self.config.get_setting('threads', 4),
+                        redirect_whispercpp_logs_to=None
+                    )
+
+                    print("[pywhispercpp] Model loaded successfully", flush=True)
+                    print(f"[BACKEND] Using pywhispercpp (in-process) with {gpu_backend} acceleration", flush=True)
+                    import sys
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    self.ready = True
+                    return True
+
+                except ImportError as e:
+                    print(f"[pywhispercpp] Import failed: {e}")
+                    return False
+                except Exception as e:
+                    print(f"[pywhispercpp] Initialization failed: {e}")
+                    return False
+
         except Exception as e:
             print(f"ERROR: Failed to initialize Whisper manager: {e}")
             return False
@@ -87,7 +118,136 @@ class WhisperManager:
         if shutil.which('vulkaninfo'):
             return "Vulkan"
         return "CPU"
-    
+
+    def _numpy_to_wav_bytes(self, audio_data: np.ndarray, sample_rate: int = 16000) -> bytes:
+        """
+        Convert numpy audio array to WAV format bytes (in-memory)
+
+        Args:
+            audio_data: NumPy array of audio samples (float32)
+            sample_rate: Sample rate of the audio data
+
+        Returns:
+            WAV file as bytes
+        """
+        try:
+            # Convert float32 to int16 for WAV format
+            if audio_data.dtype == np.float32:
+                audio_int16 = (audio_data * 32767).astype(np.int16)
+            else:
+                audio_int16 = audio_data.astype(np.int16)
+
+            # Create WAV file in memory
+            wav_buffer = BytesIO()
+            with wave.open(wav_buffer, 'wb') as wav_file:
+                wav_file.setnchannels(1)  # mono
+                wav_file.setsampwidth(2)  # 16-bit
+                wav_file.setframerate(sample_rate)
+                wav_file.writeframes(audio_int16.tobytes())
+
+            # Get the bytes
+            wav_bytes = wav_buffer.getvalue()
+            return wav_bytes
+
+        except Exception as e:
+            print(f"ERROR: Failed to convert audio to WAV: {e}")
+            raise
+
+    def _transcribe_rest(self, audio_data: np.ndarray, sample_rate: int = 16000) -> str:
+        """
+        Transcribe audio using remote REST API endpoint
+
+        Args:
+            audio_data: NumPy array of audio samples (float32)
+            sample_rate: Sample rate of the audio data
+
+        Returns:
+            Transcribed text string
+        """
+        try:
+            import requests
+
+            # Get REST endpoint configuration
+            endpoint_url = self.config.get_setting('rest_endpoint_url')
+            api_key = self.config.get_setting('rest_api_key')
+            timeout = self.config.get_setting('rest_timeout', 30)
+
+            if not endpoint_url:
+                raise ValueError("REST endpoint URL not configured")
+
+            print(f"[TRANSCRIBE] Using remote REST API: {endpoint_url}", flush=True)
+
+            # Convert audio to WAV format
+            wav_bytes = self._numpy_to_wav_bytes(audio_data, sample_rate)
+            print(f"[REST] Converted audio to WAV format ({len(wav_bytes)} bytes)", flush=True)
+
+            # Prepare the request
+            files = {
+                'file': ('audio.wav', wav_bytes, 'audio/wav')
+            }
+
+            headers = {}
+            if api_key:
+                headers['Authorization'] = f'Bearer {api_key}'
+
+            # Add language parameter if configured
+            data = {}
+            language = self.config.get_setting('language', None)
+            if language:
+                data['language'] = language
+
+            # Send the request
+            print(f"[REST] Sending request to {endpoint_url}...", flush=True)
+            response = requests.post(
+                endpoint_url,
+                files=files,
+                data=data,
+                headers=headers,
+                timeout=timeout
+            )
+
+            # Check for HTTP errors
+            if response.status_code != 200:
+                error_msg = f"REST API returned status {response.status_code}"
+                try:
+                    error_detail = response.json()
+                    error_msg += f": {error_detail}"
+                except:
+                    error_msg += f": {response.text[:200]}"
+                print(f"ERROR: {error_msg}")
+                return ""
+
+            # Parse the response
+            result = response.json()
+
+            # Try common response formats
+            transcription = ""
+            if 'text' in result:
+                transcription = result['text']
+            elif 'transcription' in result:
+                transcription = result['transcription']
+            elif 'result' in result:
+                transcription = result['result']
+            else:
+                print(f"ERROR: Unexpected response format: {result}")
+                return ""
+
+            print(f"[REST] Transcription received ({len(transcription)} chars)", flush=True)
+            return transcription.strip()
+
+        except requests.exceptions.Timeout:
+            print(f"ERROR: REST API request timed out after {timeout}s")
+            return ""
+        except requests.exceptions.ConnectionError as e:
+            print(f"ERROR: Failed to connect to REST API: {e}")
+            return ""
+        except requests.exceptions.RequestException as e:
+            print(f"ERROR: REST API request failed: {e}")
+            return ""
+        except Exception as e:
+            print(f"ERROR: REST transcription failed: {e}")
+            return ""
+
     def is_ready(self) -> bool:
         """Check if whisper is ready for transcription"""
         return self.ready
@@ -95,51 +255,59 @@ class WhisperManager:
     def transcribe_audio(self, audio_data: np.ndarray, sample_rate: int = 16000) -> str:
         """
         Transcribe audio data using whisper
-        
+
         Args:
             audio_data: NumPy array of audio samples (float32)
             sample_rate: Sample rate of the audio data
-            
+
         Returns:
             Transcribed text string
         """
-        if not self.ready:
-            raise RuntimeError("Whisper manager not initialized")
-        
-        print("[TRANSCRIBE] Using pywhispercpp backend", flush=True)
-        import sys
-        sys.stdout.flush()
-        sys.stderr.flush()
-        
         # Check if we have valid audio data
         if audio_data is None:
             print("No audio data provided to transcribe")
             return ""
-        
+
         if len(audio_data) == 0:
             print("Empty audio data provided to transcribe")
             return ""
-        
+
         # Check if audio is too short (less than 0.1 seconds)
         min_samples = int(sample_rate * 0.1)  # 0.1 seconds minimum
         if len(audio_data) < min_samples:
             print(f"Audio too short: {len(audio_data)} samples (minimum {min_samples})")
             return ""
-        
-        try:
-            # Get language setting from config (None = auto-detect)
-            language = self.config.get_setting('language', None)
-            
-            # Transcribe with language parameter if specified
-            if language:
-                segments = self._pywhisper_model.transcribe(audio_data, language=language)
-            else:
-                segments = self._pywhisper_model.transcribe(audio_data)
-            
-            return ' '.join(seg.text for seg in segments).strip()
-        except Exception as e:
-            print(f"ERROR: pywhispercpp transcription failed: {e}")
-            return ""
+
+        # Route to appropriate backend
+        backend = self.config.get_setting('transcription_backend', 'local')
+
+        if backend == 'remote':
+            # Use REST API transcription
+            return self._transcribe_rest(audio_data, sample_rate)
+        else:
+            # Use local pywhispercpp transcription
+            if not self.ready:
+                raise RuntimeError("Whisper manager not initialized")
+
+            print("[TRANSCRIBE] Using pywhispercpp backend", flush=True)
+            import sys
+            sys.stdout.flush()
+            sys.stderr.flush()
+
+            try:
+                # Get language setting from config (None = auto-detect)
+                language = self.config.get_setting('language', None)
+
+                # Transcribe with language parameter if specified
+                if language:
+                    segments = self._pywhisper_model.transcribe(audio_data, language=language)
+                else:
+                    segments = self._pywhisper_model.transcribe(audio_data)
+
+                return ' '.join(seg.text for seg in segments).strip()
+            except Exception as e:
+                print(f"ERROR: pywhispercpp transcription failed: {e}")
+                return ""
 
     def _validate_model_file(self, model_name: str) -> bool:
         """Validate that model file exists and is not corrupted"""
