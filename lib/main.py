@@ -128,14 +128,16 @@ class hyprwhsprApp:
         try:
             self.is_processing = True
             print("🧠 Processing audio with Whisper...")
-            
-            # Transcribe audio
+
+            # Time the transcription
+            transcribe_start = time.time()
             transcription = self.whisper_manager.transcribe_audio(audio_data)
-            
+            transcribe_time_ms = (time.time() - transcribe_start) * 1000
+
             if transcription and transcription.strip():
                 self.current_transcription = transcription.strip()
-                print(f"📝 Transcription: {self.current_transcription}")
-                
+                print(f"📝 Transcription: {self.current_transcription} ({transcribe_time_ms:.0f}ms)")
+
                 # Inject text
                 self._inject_text(self.current_transcription)
             else:
@@ -150,14 +152,18 @@ class hyprwhsprApp:
         """Inject transcribed text into active application"""
         try:
             print(f"⌨️ Injecting text: {text}")
-            self.text_injector.inject_text(text)
 
-            # Calculate and log response time
+            # Time the text injection
+            inject_start = time.time()
+            self.text_injector.inject_text(text)
+            inject_time_ms = (time.time() - inject_start) * 1000
+
+            # Calculate and log total response time
             if self.processing_start_time is not None:
-                response_time_ms = (time.time() - self.processing_start_time) * 1000
-                print(f"✅ Text injection completed ({response_time_ms:.0f}ms)")
+                total_time_ms = (time.time() - self.processing_start_time) * 1000
+                print(f"✅ Text injection completed (injection: {inject_time_ms:.0f}ms, total: {total_time_ms:.0f}ms)")
             else:
-                print("✅ Text injection completed")
+                print(f"✅ Text injection completed ({inject_time_ms:.0f}ms)")
         except Exception as e:
             print(f"❌ Text injection failed: {e}")
 
