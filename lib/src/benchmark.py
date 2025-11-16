@@ -29,7 +29,22 @@ class BenchmarkRunner:
         Args:
             config_path: Optional path to config file. Uses default if None.
         """
-        self.config_manager = ConfigManager(config_path)
+        self.config_manager = ConfigManager()
+
+        # If custom config path provided, load it manually
+        if config_path:
+            try:
+                custom_config_path = Path(config_path)
+                if custom_config_path.exists():
+                    with open(custom_config_path, 'r', encoding='utf-8') as f:
+                        custom_config = json.load(f)
+                        self.config_manager.config.update(custom_config)
+                        logger.info(f"Loaded custom config from: {config_path}")
+                else:
+                    logger.warning(f"Custom config not found: {config_path}, using default")
+            except Exception as e:
+                logger.error(f"Failed to load custom config: {e}, using default")
+
         self.config = self.config_manager.config
         self.whisper_manager = None
         self.audio_capture = None
