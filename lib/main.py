@@ -127,8 +127,14 @@ class hyprwhsprApp:
 
         try:
             self.is_processing = True
-            print("🧠 Processing audio with Whisper...")
-            
+
+            # Display appropriate message based on backend
+            backend = self.config.get_setting('transcription_backend', 'local')
+            if backend == 'remote':
+                print("🧠 Processing audio with remote API...")
+            else:
+                print("🧠 Processing audio with Whisper...")
+
             # Transcribe audio
             transcription = self.whisper_manager.transcribe_audio(audio_data)
             
