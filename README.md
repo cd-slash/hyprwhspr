@@ -77,6 +77,67 @@ Any snags, please [create an issue](https://github.com/goodroot/hyprwhspr/issues
 
 - **`Super+Alt+D`** - Toggle dictation on/off
 
+## Benchmarking
+
+hyprwhspr includes a built-in benchmarking tool to measure transcription performance:
+
+```bash
+# Benchmark with an existing audio file
+hyprwhspr-benchmark --audio-file recording.wav
+
+# Record and benchmark (manual start/stop)
+hyprwhspr-benchmark --record
+
+# Record fixed duration and benchmark
+hyprwhspr-benchmark --record --duration 5
+
+# Record, save, and benchmark
+hyprwhspr-benchmark --record --save-audio test.wav
+
+# JSON output for scripting
+hyprwhspr-benchmark --audio-file test.wav --json
+
+# Use custom config
+hyprwhspr-benchmark --audio-file test.wav --config ~/my-config.json
+```
+
+**Benchmark output includes:**
+
+- Audio duration (seconds)
+- Transcription time (seconds)
+- Real-time factor (transcription time / audio duration)
+  - **< 1.0x** = Faster than real-time ✓
+  - **> 1.0x** = Slower than real-time
+- Full transcription text
+- Backend type (local or remote)
+- Model name
+
+**Example output:**
+
+```
+============================================================
+BENCHMARK RESULTS
+============================================================
+Backend: local
+Model: base.en
+Audio Duration: 5.23s
+Transcription Time: 1.847s
+Real-Time Factor: 0.35x
+✓ Faster than real-time!
+------------------------------------------------------------
+Transcription:
+"This is a test of the hyprwhspr benchmarking system."
+------------------------------------------------------------
+```
+
+**Use cases:**
+
+- Compare different Whisper models (tiny, base, small, medium, large)
+- Test GPU vs CPU performance
+- Validate system performance before deployment
+- Measure impact of configuration changes
+- Create reproducible performance tests
+
 ## Configuration
 
 Edit `~/.config/hyprwhspr/config.json`:
