@@ -44,6 +44,7 @@ class hyprwhsprApp:
         self.is_recording = False
         self.is_processing = False
         self.current_transcription = ""
+        self.processing_start_time = None
 
         # Set up global shortcuts (needed for headless operation)
         self._setup_global_shortcuts()
@@ -104,7 +105,10 @@ class hyprwhsprApp:
             
             # Stop audio capture
             audio_data = self.audio_capture.stop_recording()
-            
+
+            # Start timing from when audio capture stops
+            self.processing_start_time = time.time()
+
             # Play stop sound
             self.audio_manager.play_stop_sound()
             
@@ -147,7 +151,13 @@ class hyprwhsprApp:
         try:
             print(f"⌨️ Injecting text: {text}")
             self.text_injector.inject_text(text)
-            print("✅ Text injection completed")
+
+            # Calculate and log response time
+            if self.processing_start_time is not None:
+                response_time_ms = (time.time() - self.processing_start_time) * 1000
+                print(f"✅ Text injection completed ({response_time_ms:.0f}ms)")
+            else:
+                print("✅ Text injection completed")
         except Exception as e:
             print(f"❌ Text injection failed: {e}")
 
