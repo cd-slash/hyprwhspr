@@ -131,21 +131,21 @@ class hyprwhsprApp:
             # Display appropriate message based on backend
             backend = self.config.get_setting('transcription_backend', 'local')
             if backend == 'remote':
-                print("🧠 Processing audio with remote API...")
+                print("🧠 Processing audio with remote API...", flush=True)
             else:
-                print("🧠 Processing audio with Whisper...")
+                print("🧠 Processing audio with Whisper...", flush=True)
 
             # Transcribe audio
             transcription = self.whisper_manager.transcribe_audio(audio_data)
-            
+
             if transcription and transcription.strip():
                 self.current_transcription = transcription.strip()
-                print(f"📝 Transcription: {self.current_transcription}")
-                
+                print(f"📝 Transcription: {self.current_transcription}", flush=True)
+
                 # Inject text
                 self._inject_text(self.current_transcription)
             else:
-                print("⚠️ No transcription generated")
+                print("⚠️ No transcription generated", flush=True)
                 
         except Exception as e:
             print(f"❌ Error processing audio: {e}")
@@ -155,17 +155,17 @@ class hyprwhsprApp:
     def _inject_text(self, text):
         """Inject transcribed text into active application"""
         try:
-            print(f"⌨️ Injecting text: {text}")
+            print(f"⌨️ Injecting text: {text}", flush=True)
             self.text_injector.inject_text(text)
 
             # Calculate and log response time
             if self.processing_start_time is not None:
                 response_time_ms = (time.time() - self.processing_start_time) * 1000
-                print(f"✅ Text injection completed ({response_time_ms:.0f}ms)")
+                print(f"✅ Text injection completed ({response_time_ms:.0f}ms)", flush=True)
             else:
-                print("✅ Text injection completed")
+                print("✅ Text injection completed", flush=True)
         except Exception as e:
-            print(f"❌ Text injection failed: {e}")
+            print(f"❌ Text injection failed: {e}", flush=True)
 
     def _write_recording_status(self, is_recording):
         """Write recording status to file for tray script"""
