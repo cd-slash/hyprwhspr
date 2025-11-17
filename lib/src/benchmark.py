@@ -57,7 +57,10 @@ class BenchmarkRunner:
         """
         try:
             logger.info("Initializing Whisper transcription backend...")
-            self.whisper_manager = WhisperManager(self.config)
+            self.whisper_manager = WhisperManager(self.config_manager)
+            if not self.whisper_manager.initialize():
+                logger.error("Failed to initialize Whisper backend")
+                return False
             return True
         except Exception as e:
             logger.error(f"Failed to initialize Whisper: {e}")
@@ -125,7 +128,8 @@ class BenchmarkRunner:
         """
         try:
             logger.info("Initializing audio capture...")
-            self.audio_capture = AudioCapture(self.config)
+            audio_device_id = self.config.get('audio_device', None)
+            self.audio_capture = AudioCapture(device_id=audio_device_id)
 
             if duration:
                 logger.info(f"Recording {duration}s of audio...")
