@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-hyprwhspr - Voice dictation application for Hyprland (Headless Mode)
+hyprwhspr - Voice dictation application (Cross-platform)
 Fast, reliable speech-to-text with instant text injection
+Supports Linux (Hyprland) and macOS
 """
 
 print("🚀 HYPRWHSPR STARTING UP!")
 print("=" * 50)
 
 import sys
+import platform
 import time
 from pathlib import Path
+
+# Detect platform
+PLATFORM = platform.system()
+print(f"Platform detected: {PLATFORM}")
 
 # Add the src directory to the Python path
 src_path = Path(__file__).parent / 'src'
@@ -18,9 +24,21 @@ sys.path.insert(0, str(src_path))
 from config_manager import ConfigManager
 from audio_capture import AudioCapture
 from whisper_manager import WhisperManager
-from text_injector import TextInjector
-from global_shortcuts import GlobalShortcuts
 from audio_manager import AudioManager
+
+# Import platform-specific modules
+if PLATFORM == 'Darwin':  # macOS
+    print("Loading macOS modules...")
+    from text_injector_macos import TextInjector
+    from global_shortcuts_macos import GlobalShortcuts
+elif PLATFORM == 'Linux':
+    print("Loading Linux modules...")
+    from text_injector import TextInjector
+    from global_shortcuts import GlobalShortcuts
+else:
+    print(f"ERROR: Unsupported platform: {PLATFORM}")
+    print("hyprwhspr only supports Linux and macOS")
+    sys.exit(1)
 
 class hyprwhsprApp:
     """Main application class for hyprwhspr voice dictation (Headless Mode)"""

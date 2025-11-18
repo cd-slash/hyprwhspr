@@ -3,11 +3,15 @@
 </h1>
 
 <p align="center">
-    <b>Native speech-to-text for Arch / Omarchy</b> - Fast, accurate and easy system-wide dictation
+    <b>Native speech-to-text for Linux & macOS</b> - Fast, accurate and easy system-wide dictation
 </p>
 
 <p align="center">
-all local | waybar integration | audio feedback | auto-paste | cpu or gpu | easy setup
+all local | cross-platform | audio feedback | auto-paste | cpu or gpu | easy setup
+</p>
+
+<p align="center">
+    <b>🍎 macOS support now available!</b> Toggle with Globe/Fn key
 </p>
 
  <p align="center">
@@ -18,24 +22,31 @@ https://github.com/user-attachments/assets/40cb1837-550c-4e6e-8d61-07ea59898f12
 
 ---
 
-- **Optimized for Arch Linux / Omarchy** - Seamless integration with [Omarchy](https://omarchy.org/) / [Hyprland](https://github.com/hyprwm/Hyprland) & [Waybar](https://github.com/Alexays/Waybar)
+- **Cross-platform** - Works on Linux (Arch/Omarchy/Hyprland) and macOS
+- **Globe key toggle** - Use the macOS globe/fn key for instant dictation
 - **Whisper-powered** - State-of-the-art speech recognition via [OpenAI's Whisper](https://github.com/openai/whisper)
-- **Cross-platform GPU support** - Automatic detection and acceleration for NVIDIA (CUDA) / AMD (ROCm) 
+- **GPU acceleration** - Automatic NVIDIA (CUDA) / AMD (ROCm) / Apple Metal support
 - **Hot model loading** - pywhispercpp backend keeps models in memory for _fast_ transcription
 - **Word overrides** - Customize transcriptions, prompt and corrections
-- **Run as user** - Runs in user space, just sudo once for the installer
+- **Run as user** - Runs in user space, no system-level installation needed
 
-> 🔐 **PRIVATE**: hyprwhspr is local and never reads any clipboard / audio content 
+> 🔐 **PRIVATE**: hyprwhspr is local and never reads any clipboard / audio content
 
 ## Quick start
 
-### Prerequisites
+### macOS Installation
 
-- **[Omarchy](https://omarchy.org/)** or **[Arch Linux](https://archlinux.org/)**
-- **NVIDIA GPU** (optional, for CUDA acceleration)
-- **AMD GPU** (optional, for ROCm acceleration)
+**See [README-macOS.md](README-macOS.md) for complete macOS instructions**
 
-### Installation
+```bash
+git clone https://github.com/goodroot/hyprwhspr.git
+cd hyprwhspr
+./scripts/install-macos.sh
+```
+
+Then grant Accessibility permissions and press the **Globe/Fn key** to toggle dictation!
+
+### Linux Installation (Arch/Omarchy)
 
 "Just works" with Omarchy.
 

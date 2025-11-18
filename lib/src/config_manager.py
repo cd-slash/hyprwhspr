@@ -4,17 +4,22 @@ Handles loading, saving, and managing application settings
 """
 
 import json
+import platform
 from pathlib import Path
 from typing import Any, Dict
 
 
 class ConfigManager:
     """Manages application configuration and settings"""
-    
+
     def __init__(self):
+        # Platform-specific default shortcut
+        is_macos = platform.system() == 'Darwin'
+        default_shortcut = 'fn' if is_macos else 'SUPER+ALT+D'
+
         # Default configuration values - minimal set for hyprwhspr
         self.default_config = {
-            'primary_shortcut': 'SUPER+ALT+D',
+            'primary_shortcut': default_shortcut,
             'model': 'base',
             'threads': 4,           # Thread count for whisper processing
             'language': None,       # Language code for transcription (None = auto-detect, or 'en', 'nl', 'fr', etc.)
