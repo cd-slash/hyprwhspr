@@ -81,6 +81,8 @@ OPTIONS = {
     'site_packages': True,
     'strip': False,
     'semi_standalone': False,
+    'compressed': False,  # DON'T compress - dylibs can't load from zip!
+    'optimize': 0,  # Don't optimize to keep everything accessible
 }
 
 setup(
