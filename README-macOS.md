@@ -15,10 +15,10 @@ Native speech-to-text dictation for macOS with **Globe/Fn key** toggle support.
 
 ### Installation
 
-1.  **Download the DMG:**
-    -   Go to the [releases page](https://github.com/goodroot/hyprwhspr/releases) and download the latest `hyprwhspr-installer.dmg`.
+1.  **Build the App:**
+    -   Follow the "Building from Source" instructions below to create the `hyprwhspr-installer.dmg`.
 2.  **Install the App:**
-    -   Open the DMG file.
+    -   Open the `dist/hyprwhspr-installer.dmg` file.
     -   Drag `hyprwhspr.app` to your `Applications` folder.
 
 ### First Use
@@ -48,6 +48,8 @@ To have hyprwhspr launch automatically when you log in:
 You can customize hyprwhspr by editing the configuration file located at:
 `~/Library/Application Support/hyprwhspr/config.json`
 
+(Note: The `config.json` file is created the first time you run the app.)
+
 ### Change the Toggle Key
 
 ```json
@@ -56,84 +58,14 @@ You can customize hyprwhspr by editing the configuration file located at:
 }
 ```
 
-**Available options:**
-- `"fn"` or `"globe"` - Globe/Fn key (default)
-- `"f12"` - F12 key
-- `"cmd+shift+d"` - Command+Shift+D
-- `"cmd+space"` - Command+Space
-- Any combination of `cmd`, `ctrl`, `option`, `shift` + any key
-
 ### Choose a Different Model
 
-```json
-{
-    "model": "small.en"
-}
-```
-
-**Available models:**
-- `"tiny.en"` - Fastest, least accurate (~75MB)
-- `"base.en"` - Good balance (default, ~148MB)
-- `"small.en"` - Better accuracy (~488MB)
-- `"medium.en"` - High accuracy (~1.5GB)
-- `"large"` - Best accuracy, requires Apple Silicon or GPU (~3GB)
-
-You can download additional models and place them in:
+Download additional models and place them in:
 `~/Library/Application Support/hyprwhspr/models/`
-
-### Word Overrides
-
-Customize how Whisper transcribes specific words:
-
-```json
-{
-    "word_overrides": {
-        "hyperwhisper": "hyprwhspr",
-        "mac os": "macOS"
-    }
-}
-```
-
-## Troubleshooting
-
-### Globe Key Not Working
-
--   **Check Accessibility Permissions:**
-    1.  Go to **System Settings** > **Privacy & Security** > **Accessibility**.
-    2.  Make sure `hyprwhspr` is in the list and the toggle is enabled.
-    3.  If it's already enabled, try toggling it off and on again.
-
-### No Audio Input
-
--   **Check Microphone Permissions:**
-    1.  Go to **System Settings** > **Privacy & Security** > **Microphone**.
-    2.  Ensure `hyprwhspr` is in the list and the toggle is enabled.
--   **Check System Sound Settings:**
-    1.  Go to **System Settings** > **Sound** > **Input**.
-    2.  Select your preferred microphone and check the input level.
-
-### Text Not Appearing
-
--   hyprwhspr uses the clipboard and simulates **Cmd+V** to paste text. Make sure the target application supports pasting.
-
-### Viewing Logs
-
-Logs are stored at:
--   `~/Library/Logs/hyprwhspr/hyprwhspr.log` (for general output)
--   `~/Library/Logs/hyprwhspr/hyprwhspr-error.log` (for errors)
-
-## Uninstalling
-
-1.  Drag `hyprwhspr.app` from your `Applications` folder to the Trash.
-2.  (Optional) Remove the configuration and log files:
-    ```bash
-    rm -rf "~/Library/Application Support/hyprwhspr"
-    rm -rf "~/Library/Logs/hyprwhspr"
-    ```
 
 ## Building from Source
 
-If you want to build the app yourself:
+If you want to build the app and installer yourself:
 
 1.  **Clone the repository:**
     ```bash
@@ -141,11 +73,28 @@ If you want to build the app yourself:
     cd hyprwhspr
     ```
 2.  **Run the build script:**
+    - This will create `hyprwhspr.app` in the `dist/` folder.
     ```bash
-    ./scripts/install-macos.sh
+    ./scripts/build-macos.sh
     ```
-3.  **Find the installer:**
-    -   The DMG will be in the `dist` folder.
+3.  **Create the DMG installer:**
+    - This will package the app into `hyprwhspr-installer.dmg` in the `dist/` folder.
+    ```bash
+    ./scripts/create-dmg.sh
+    ```
+4.  **Install the app:**
+    - Open the newly created DMG and drag the app to your Applications folder.
+    ```bash
+    open dist/hyprwhspr-installer.dmg
+    ```
+
+## Uninstallation
+
+1.  Drag `hyprwhspr.app` from your `Applications` folder to the Trash.
+2.  (Optional) Remove the configuration and log files:
+    ```bash
+    rm -rf "~/Library/Application Support/hyprwhspr"
+    ```
 
 ## Privacy
 
