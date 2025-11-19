@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # This script creates a professional DMG installer for the hyprwhspr.app bundle.
-# It customizes the DMG window with a proper layout.
+# It correctly handles permissions to avoid the need for sudo.
 #
 
 set -e
@@ -12,7 +12,7 @@ echo "==================================================="
 
 # --- Configuration ---
 APP_NAME="hyprwhspr.app"
-VOL_NAME="hyprwhspr Installer"
+VOL_NAME="hyprwhspr" # Use a simple name with no spaces
 FINAL_DMG_NAME="hyprwhspr-installer.dmg"
 
 # Get project directory
@@ -24,7 +24,8 @@ cd "$REPO_DIR"
 BUILD_DIR="dist"
 APP_PATH="$BUILD_DIR/$APP_NAME"
 FINAL_DMG_PATH="$BUILD_DIR/$FINAL_DMG_NAME"
-TEMP_DMG_PATH="/tmp/temp_${RANDOM}.dmg"
+# Use a temp file in the build dir to avoid /tmp issues
+TEMP_DMG_PATH="$BUILD_DIR/temp_$(date +%s).dmg"
 
 # Check if the app bundle exists
 if [ ! -d "$APP_PATH" ]; then
@@ -46,6 +47,10 @@ hdiutil create -size 500m -fs HFS+ -volname "$VOL_NAME" "$TEMP_DMG_PATH"
 echo "Mounting temporary disk image..."
 MOUNT_DIR=$(hdiutil attach "$TEMP_DMG_PATH" -nobrowse -noverify -noautofsck | grep '/Volumes/' | awk 'NR==1{print $3}')
 echo "Mounted at: $MOUNT_DIR"
+
+# *** FIX: Change permissions of the mounted volume to be user-writable ***
+echo "Fixing volume permissions..."
+chmod -R 775 "$MOUNT_DIR"
 
 # Copy the application and create a link to /Applications
 echo "Copying application files..."
@@ -69,17 +74,16 @@ tell application "Finder"
     set icon size of theViewOptions to 96
     set position of item "'$APP_NAME'" of container window to {150, 175}
     set position of item "Applications" of container window to {400, 175}
-    close
-    open
     update without registering applications
-    delay 2
+    delay 1
+    close
   end tell
 end tell
 EOD
 
 # Unmount the disk image
 echo "Unmounting disk image..."
-hdiutil detach "$MOUNT_DIR"
+hdiutil detach "$MOUNT_DIR" -force
 
 # Convert to a compressed, read-only final DMG
 echo "Creating final compressed DMG..."
