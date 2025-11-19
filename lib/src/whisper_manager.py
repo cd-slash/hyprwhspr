@@ -89,10 +89,13 @@ class WhisperManager:
 
                 print("[pywhispercpp] Model loaded successfully", flush=True)
                 print(f"[BACKEND] Using pywhispercpp (in-process) with {gpu_backend} acceleration", flush=True)
+                print("DEBUG: About to flush streams...", flush=True)
                 import sys
                 sys.stdout.flush()
                 sys.stderr.flush()
+                print("DEBUG: Streams flushed, setting ready=True...", flush=True)
                 self.ready = True
+                print("DEBUG: About to return True from initialize()", flush=True)
                 return True
 
             except ImportError as e:

@@ -18,7 +18,14 @@ PLATFORM = platform.system()
 print(f"Platform detected: {PLATFORM}")
 
 # Add the src directory to the Python path
-src_path = Path(__file__).parent / 'src'
+# Handle PyInstaller frozen mode
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    # Running in PyInstaller bundle
+    base_path = Path(sys._MEIPASS)
+    src_path = base_path / 'lib' / 'src'
+else:
+    # Running normally
+    src_path = Path(__file__).parent / 'src'
 sys.path.insert(0, str(src_path))
 
 from config_manager import ConfigManager
@@ -30,7 +37,10 @@ from audio_manager import AudioManager
 if PLATFORM == 'Darwin':  # macOS
     print("Loading macOS modules...")
     from text_injector_macos import TextInjector
-    from global_shortcuts_macos import GlobalShortcuts
+    from global_shortcuts_macos import GlobalShortcuts, check_accessibility_permissions
+    from menubar_icon import create_menubar
+    from AppKit import NSApplication, NSTimer
+    from PyObjCTools import AppHelper
 elif PLATFORM == 'Linux':
     print("Loading Linux modules...")
     from text_injector import TextInjector
@@ -57,12 +67,21 @@ class hyprwhsprApp:
         self.whisper_manager = WhisperManager()
         self.text_injector = TextInjector(self.config)
         self.global_shortcuts = None
+        self.menubar = None
+        self.permissions_ok = False
 
         # Application state
         self.is_recording = False
         self.is_processing = False
         self.current_transcription = ""
         self.processing_start_time = None
+
+        # Check accessibility permissions on macOS
+        if PLATFORM == 'Darwin':
+            self.permissions_ok = check_accessibility_permissions()
+            if not self.permissions_ok:
+                print("\n⚠️  WARNING: Accessibility permissions not granted!")
+                print("The global hotkey will not work until you grant permissions.")
 
         # Set up global shortcuts (needed for headless operation)
         self._setup_global_shortcuts()
@@ -92,21 +111,27 @@ class hyprwhsprApp:
         try:
             print("🎤 Starting recording...")
             self.is_recording = True
-            
+
+            # Update menubar on macOS
+            if PLATFORM == 'Darwin' and self.menubar:
+                self.menubar.update_recording_status(True)
+
             # Write recording status to file for tray script
             self._write_recording_status(True)
-            
+
             # Play start sound
             self.audio_manager.play_start_sound()
-            
+
             # Start audio capture
             self.audio_capture.start_recording()
-            
+
             print("✅ Recording started - speak now!")
-            
+
         except Exception as e:
             print(f"❌ Failed to start recording: {e}")
             self.is_recording = False
+            if PLATFORM == 'Darwin' and self.menubar:
+                self.menubar.update_recording_status(False)
             self._write_recording_status(False)
 
     def _stop_recording(self):
@@ -117,10 +142,14 @@ class hyprwhsprApp:
         try:
             print("🛑 Stopping recording...")
             self.is_recording = False
-            
+
+            # Update menubar on macOS
+            if PLATFORM == 'Darwin' and self.menubar:
+                self.menubar.update_recording_status(False)
+
             # Write recording status to file for tray script
             self._write_recording_status(False)
-            
+
             # Stop audio capture
             audio_data = self.audio_capture.stop_recording()
 
@@ -129,12 +158,12 @@ class hyprwhsprApp:
 
             # Play stop sound
             self.audio_manager.play_stop_sound()
-            
+
             if audio_data is not None:
                 self._process_audio(audio_data)
             else:
                 print("⚠️ No audio data captured")
-                
+
         except Exception as e:
             print(f"❌ Error stopping recording: {e}")
 
@@ -197,33 +226,70 @@ class hyprwhsprApp:
 
     def run(self):
         """Start the application"""
-        print("🚀 Starting hyprwhspr...")
+        try:
+            print("🚀 Starting hyprwhspr...")
 
-        # Initialize whisper manager
-        if not self.whisper_manager.initialize():
-            print("❌ Failed to initialize Whisper. Please ensure whisper.cpp is built.")
-            print("Run the build scripts first.")
+            # Initialize whisper manager
+            print("DEBUG: About to initialize whisper...", flush=True)
+            init_result = self.whisper_manager.initialize()
+            print(f"DEBUG: Whisper init returned: {init_result}", flush=True)
+
+            if not init_result:
+                print("❌ Failed to initialize Whisper. Please ensure whisper.cpp is built.", flush=True)
+                print("Run the build scripts first.", flush=True)
+                return False
+
+            print("✅ hyprwhspr initialized successfully", flush=True)
+            print("🎤 Listening for global shortcuts...", flush=True)
+        except Exception as e:
+            print(f"❌ Error in run() before shortcuts: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
             return False
 
-        print("✅ hyprwhspr initialized successfully")
-        print("🎤 Listening for global shortcuts...")
-        
         # Start global shortcuts
         if self.global_shortcuts:
+            print("DEBUG: About to start global shortcuts", flush=True)
             self.global_shortcuts.start()
-        
-        try:
-            # Keep the application running
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            print("\n🛑 Shutting down hyprwhspr...")
-            self._cleanup()
-        except Exception as e:
-            print(f"❌ Error in main loop: {e}")
-            self._cleanup()
-            return False
-        
+            print("DEBUG: Global shortcuts started, continuing...", flush=True)
+
+        # Setup menubar on macOS
+        if PLATFORM == 'Darwin':
+            print("DEBUG: Reached macOS section", flush=True)
+            print("🖥️  Setting up menubar icon...", flush=True)
+
+            # Activate the application
+            app = NSApplication.sharedApplication()
+            app.setActivationPolicy_(1)  # NSApplicationActivationPolicyAccessory
+
+            self.menubar = create_menubar(
+                toggle_callback=self._on_shortcut_triggered,
+                quit_callback=self._cleanup,
+                permissions_ok=self.permissions_ok
+            )
+            print("✅ Menubar icon created", flush=True)
+
+            # Use Cocoa event loop for macOS
+            try:
+                print("DEBUG: Starting Cocoa event loop...", flush=True)
+                AppHelper.runEventLoop()
+            except KeyboardInterrupt:
+                print("\n🛑 Shutting down hyprwhspr...", flush=True)
+                self._cleanup()
+        else:
+            # Linux: use simple event loop
+            try:
+                # Keep the application running
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                print("\n🛑 Shutting down hyprwhspr...")
+                self._cleanup()
+            except Exception as e:
+                print(f"❌ Error in main loop: {e}")
+                self._cleanup()
+                return False
+
         return True
 
     def _cleanup(self):

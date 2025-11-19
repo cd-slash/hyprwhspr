@@ -36,12 +36,20 @@ class AudioManager:
         
         # Audio file paths - use custom paths if specified, otherwise fall back to defaults
         # Look for assets in the installation directory first, then fall back to relative paths
-        install_dir = Path("/usr/lib/hyprwhspr")
-        self.assets_dir = install_dir / "share" / "assets"
-        
-        # Fallback to relative paths if installation directory doesn't exist
-        if not self.assets_dir.exists():
-            self.assets_dir = Path(__file__).parent.parent / "assets"
+        import sys
+
+        # Handle PyInstaller frozen mode
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            # Running in PyInstaller bundle
+            self.assets_dir = Path(sys._MEIPASS) / "share" / "assets"
+        else:
+            # Running normally - try installation directory first
+            install_dir = Path("/usr/lib/hyprwhspr")
+            self.assets_dir = install_dir / "share" / "assets"
+
+            # Fallback to relative paths if installation directory doesn't exist
+            if not self.assets_dir.exists():
+                self.assets_dir = Path(__file__).parent.parent / "assets"
         
         # Start sound path resolution
         if self.start_sound_path:
