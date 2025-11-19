@@ -3,12 +3,26 @@ Setup script to build hyprwhspr as a standalone macOS application
 Uses py2app to create a proper .app bundle with all dependencies
 """
 
+import sys
+from pathlib import Path
 from setuptools import setup
 
+# Add lib/src to path so py2app can find the modules
+repo_dir = Path(__file__).parent
+lib_src = repo_dir / 'lib' / 'src'
+sys.path.insert(0, str(lib_src))
+
 APP = ['lib/main.py']
-DATA_FILES = [
-    ('share/assets', ['share/assets/ping-up.ogg', 'share/assets/ping-down.ogg'])
-] if __import__('os').path.exists('share/assets') else []
+DATA_FILES = []
+
+# Include audio assets if they exist
+assets_dir = repo_dir / 'share' / 'assets'
+if assets_dir.exists():
+    asset_files = []
+    for asset in assets_dir.glob('*.ogg'):
+        asset_files.append(str(asset))
+    if asset_files:
+        DATA_FILES.append(('assets', asset_files))
 
 OPTIONS = {
     'argv_emulation': False,
@@ -31,9 +45,7 @@ OPTIONS = {
         'pywhispercpp',
         'requests',
         'psutil',
-        'AppKit',
-        'Quartz',
-        'Cocoa',
+        'rich',
     ],
     'includes': [
         'config_manager',
@@ -42,13 +54,23 @@ OPTIONS = {
         'audio_manager',
         'text_injector_macos',
         'global_shortcuts_macos',
+        'logger',
+    ],
+    'frameworks': [
+        '/System/Library/Frameworks/CoreAudio.framework',
+        '/System/Library/Frameworks/AudioToolbox.framework',
     ],
     'excludes': [
         'tkinter',
         'PyQt5',
         'matplotlib',
+        'evdev',  # Linux only
+        'text_injector',  # Linux version
+        'global_shortcuts',  # Linux version
     ],
     'site_packages': True,
+    'strip': False,
+    'semi_standalone': False,
 }
 
 setup(
