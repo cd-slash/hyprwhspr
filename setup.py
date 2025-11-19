@@ -56,10 +56,6 @@ OPTIONS = {
         'global_shortcuts_macos',
         'logger',
     ],
-    'frameworks': [
-        '/System/Library/Frameworks/CoreAudio.framework',
-        '/System/Library/Frameworks/AudioToolbox.framework',
-    ],
     'excludes': [
         'tkinter',
         'PyQt5',
