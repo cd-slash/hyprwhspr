@@ -38,6 +38,21 @@ try:
 except ImportError:
     print("Warning: sounddevice not found, PortAudio may not be included")
 
+# Find and include pywhispercpp's whisper.cpp library
+try:
+    import pywhispercpp
+    whspr_path = Path(pywhispercpp.__file__).parent
+    whspr_lib_path = whspr_path / 'libwhisper.dylib'
+    if whspr_lib_path.exists():
+        # Copying to Contents/Resources inside the .app bundle
+        DATA_FILES.append(('', [str(whspr_lib_path)]))
+        print(f"Found and included pywhispercpp library: {whspr_lib_path}")
+    else:
+        print(f"Warning: libwhisper.dylib not found at {whspr_lib_path}")
+except ImportError:
+    print("Warning: pywhispercpp not found, whisper library may not be included")
+
+
 OPTIONS = {
     'argv_emulation': False,
     'iconfile': None,
