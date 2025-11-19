@@ -9,7 +9,6 @@ ENTRY_POINT = 'lib/main.py'
 ASSETS_DIR = 'share/assets'
 
 # --- Find required libraries robustly ---
-# This ensures that the native libraries are found regardless of the exact path
 site_packages = next(p for p in sys.path if 'site-packages' in p)
 pywhispercpp_lib = next(Path(site_packages).glob('pywhispercpp*/libwhisper.dylib'))
 sounddevice_lib = next(Path(site_packages).glob('_sounddevice_data/portaudio-binaries/*.dylib'))
@@ -34,8 +33,10 @@ a = Analysis(
     runtime_hooks=[],
     excludes=[],
     cipher=None,
-    # --- Enable Debugging ---
-    debug=True,
+    # --- CRITICAL FIX: Do not archive Python modules ---
+    # This prevents native libraries from being trapped inside a .zip archive,
+    # which was causing the "cannot load library" error.
+    noarchive=True,
 )
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=None)
@@ -52,6 +53,6 @@ app = BUNDLE(
     info_plist={
         'NSMicrophoneUsageDescription': 'hyprwhspr needs microphone access for speech-to-text.',
         'NSAppleEventsUsageDescription': 'hyprwhspr needs accessibility permissions to paste text.',
-        # 'LSUIElement': True, # Disabled for debugging to show Dock icon
+        'LSUIElement': True,  # Run without a Dock icon
     },
 )
