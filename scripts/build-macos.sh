@@ -58,6 +58,27 @@ pip install -r "$REPO_DIR/requirements.txt"
 pip install pyinstaller
 echo -e "${GREEN}✓${NC} Dependencies installed"
 
+# --- Robustly find library paths ---
+echo ""
+echo "Locating required native libraries..."
+SITE_PACKAGES_PATH=$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+PYWHISPERCPP_LIB_PATH=$(find "$SITE_PACKAGES_PATH" -name "libwhisper.dylib" | head -n 1)
+SOUNDDEVICE_LIB_PATH=$(find "$SITE_PACKAGES_PATH" -name "*portaudio*.dylib" | head -n 1)
+
+# Check if libraries were found
+if [ -z "$PYWHISPERCPP_LIB_PATH" ]; then
+    echo -e "${RED}ERROR: libwhisper.dylib not found in the Python environment. Build failed.${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓${NC} Found libwhisper.dylib: $PYWHISPERCPP_LIB_PATH"
+
+if [ -z "$SOUNDDEVICE_LIB_PATH" ]; then
+    echo -e "${RED}ERROR: PortAudio library not found in the Python environment. Build failed.${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓${NC} Found PortAudio library: $SOUNDDEVICE_LIB_PATH"
+
+
 # --- Build the application with PyInstaller ---
 echo ""
 echo "Building hyprwhspr.app with PyInstaller..."
@@ -68,13 +89,7 @@ rm -rf build dist hyprwhspr.spec
 # PyInstaller arguments
 APP_NAME="hyprwhspr"
 ENTRY_POINT="lib/main.py"
-ICON_FILE="share/icons/hyprwhspr.icns" # Optional: specify an icon
-
-# Add assets and libraries to be bundled
-# PyInstaller's --add-data format is "SOURCE:DESTINATION"
 ASSETS_DIR="share/assets"
-PYWHISPERCPP_LIB_PATH=$(python -c "import pywhispercpp; from pathlib import Path; print(Path(pywhispercpp.__file__).parent / 'libwhisper.dylib')")
-SOUNDDEVICE_LIB_PATH=$(python -c "import sounddevice; from pathlib import Path; print(next(Path(sounddevice.__file__).parent.glob('_sounddevice_data/portaudio-binaries/*.dylib')))")
 
 pyinstaller --name "$APP_NAME" \
             --windowed \
@@ -98,4 +113,4 @@ fi
 deactivate
 echo ""
 echo "Build process complete."
-echo "You can now create a DMG installer or run the app directly from the 'dist' folder."
+echo "You can now run the app from 'dist' or create an installer with './scripts/create-dmg.sh'"
