@@ -44,8 +44,34 @@ echo ""
 echo "Application built successfully!"
 echo ""
 
-# Move to Applications
+# Post-build: Fix PortAudio dylib location
 APP_BUNDLE="$REPO_DIR/dist/hyprwhspr.app"
+echo "Fixing PortAudio library location..."
+
+# Check if python310.zip exists (it shouldn't with compressed=0, but just in case)
+RESOURCES_DIR="$APP_BUNDLE/Contents/Resources"
+if [ -f "$RESOURCES_DIR/lib/python310.zip" ]; then
+    echo "WARNING: python310.zip exists even with compressed=0"
+    echo "Extracting dylib from zip..."
+    cd "$RESOURCES_DIR/lib"
+    unzip -q python310.zip "_sounddevice_data/portaudio-binaries/*" 2>/dev/null || true
+    cd "$REPO_DIR"
+fi
+
+# Ensure dylib is in the right place
+DYLIB_SRC=$(find "$VENV_DIR/lib" -name "libportaudio*.dylib" | head -1)
+if [ -n "$DYLIB_SRC" ]; then
+    DYLIB_DEST_DIR="$RESOURCES_DIR/_sounddevice_data/portaudio-binaries"
+    mkdir -p "$DYLIB_DEST_DIR"
+    cp "$DYLIB_SRC" "$DYLIB_DEST_DIR/"
+    echo "✓ PortAudio dylib copied to bundle"
+else
+    echo "⚠ PortAudio dylib not found in venv"
+fi
+
+echo ""
+
+# Move to Applications
 DEST_DIR="$HOME/Applications"
 
 if [ -d "$APP_BUNDLE" ]; then
