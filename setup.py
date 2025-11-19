@@ -4,6 +4,7 @@ Uses py2app to create a proper .app bundle with all dependencies
 """
 
 import sys
+import sysconfig
 from pathlib import Path
 from setuptools import setup
 
@@ -23,6 +24,19 @@ if assets_dir.exists():
         asset_files.append(str(asset))
     if asset_files:
         DATA_FILES.append(('assets', asset_files))
+
+# Find and include sounddevice's PortAudio library
+try:
+    import sounddevice
+    sd_path = Path(sounddevice.__file__).parent
+    portaudio_dir = sd_path / '_sounddevice_data' / 'portaudio-binaries'
+    if portaudio_dir.exists():
+        portaudio_files = list(portaudio_dir.glob('*.dylib'))
+        if portaudio_files:
+            DATA_FILES.append(('_sounddevice_data/portaudio-binaries', [str(f) for f in portaudio_files]))
+            print(f"Found PortAudio library: {portaudio_files}")
+except ImportError:
+    print("Warning: sounddevice not found, PortAudio may not be included")
 
 OPTIONS = {
     'argv_emulation': False,
