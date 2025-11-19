@@ -44,9 +44,9 @@ try:
     whspr_path = Path(pywhispercpp.__file__).parent
     whspr_lib_path = whspr_path / 'libwhisper.dylib'
     if whspr_lib_path.exists():
-        # Copying to Contents/Resources inside the .app bundle
-        DATA_FILES.append(('', [str(whspr_lib_path)]))
-        print(f"Found and included pywhispercpp library: {whspr_lib_path}")
+        # Copying to Contents/Frameworks is a more standard location for dylibs
+        DATA_FILES.append(('Frameworks', [str(whspr_lib_path)]))
+        print(f"Found and included pywhispercpp library in Frameworks: {whspr_lib_path}")
     else:
         print(f"Warning: libwhisper.dylib not found at {whspr_lib_path}")
 except ImportError:
