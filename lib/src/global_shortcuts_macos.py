@@ -282,8 +282,18 @@ class GlobalShortcuts:
         keycode_matches = (self.target_keycode is None or
                           self.target_keycode == keycode)
 
-        # Check if modifiers match
-        modifiers_match = self.target_modifiers == modifiers
+        # Special handling for Fn key alone
+        # When Fn is pressed alone, macOS sets both the keycode AND the Fn modifier flag
+        # So we need to handle this case specially
+        if self.target_keycode == KeyCode.FUNCTION and not self.target_modifiers:
+            # We want Fn key alone - check that:
+            # 1. Keycode is Fn (63)
+            # 2. No OTHER modifiers are pressed (ignore the Fn flag itself)
+            other_modifiers = modifiers - {'FUNCTION'}
+            modifiers_match = keycode == KeyCode.FUNCTION and len(other_modifiers) == 0
+        else:
+            # Normal modifier matching for all other key combinations
+            modifiers_match = self.target_modifiers == modifiers
 
         if keycode_matches and modifiers_match:
             current_time = time.time()
