@@ -12,7 +12,7 @@ echo "==================================================="
 
 # --- Configuration ---
 APP_NAME="hyprwhspr.app"
-VOL_NAME="hyprwhspr" # Use a simple name with no spaces
+VOL_NAME="hyprwhspr"
 FINAL_DMG_NAME="hyprwhspr-installer.dmg"
 
 # Get project directory
@@ -24,7 +24,6 @@ cd "$REPO_DIR"
 BUILD_DIR="dist"
 APP_PATH="$BUILD_DIR/$APP_NAME"
 FINAL_DMG_PATH="$BUILD_DIR/$FINAL_DMG_NAME"
-# Use a temp file in the build dir to avoid /tmp issues
 TEMP_DMG_PATH="$BUILD_DIR/temp_$(date +%s).dmg"
 
 # Check if the app bundle exists
@@ -39,18 +38,25 @@ echo "App bundle found at: $APP_PATH"
 # Clean up old DMG
 rm -f "$FINAL_DMG_PATH"
 
-# Create a temporary writable disk image
-echo "Creating temporary disk image..."
-hdiutil create -size 500m -fs HFS+ -volname "$VOL_NAME" "$TEMP_DMG_PATH"
+# --- Create a user-owned temporary disk image ---
+# This is the key fix. By using -uid and -gid, we create a disk image
+# that is owned by the current user, avoiding all permission errors.
+USER_ID=$(id -u)
+GROUP_ID=$(id -g)
+
+echo "Creating temporary disk image (owned by user $USER_ID)..."
+hdiutil create -size 500m \
+               -fs HFS+ \
+               -volname "$VOL_NAME" \
+               -uid "$USER_ID" \
+               -gid "$GROUP_ID" \
+               -mode 775 \
+               "$TEMP_DMG_PATH"
 
 # Mount the disk image
 echo "Mounting temporary disk image..."
 MOUNT_DIR=$(hdiutil attach "$TEMP_DMG_PATH" -nobrowse -noverify -noautofsck | grep '/Volumes/' | awk 'NR==1{print $3}')
 echo "Mounted at: $MOUNT_DIR"
-
-# *** FIX: Change permissions of the mounted volume to be user-writable ***
-echo "Fixing volume permissions..."
-chmod -R 775 "$MOUNT_DIR"
 
 # Copy the application and create a link to /Applications
 echo "Copying application files..."
@@ -96,6 +102,6 @@ echo ""
 echo "✓ Professional DMG installer created successfully!"
 echo "  Path: $FINAL_DMG_PATH"
 echo ""
-echo "To install, run:"
+echo "Please run the installer to test:"
 echo "open $FINAL_DMG_PATH"
 echo ""
