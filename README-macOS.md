@@ -9,99 +9,72 @@ Native speech-to-text dictation for macOS with **Globe/Fn key** toggle support.
 - 🔒 **Private & Local** - All transcription happens on your Mac
 - ⚡ **Fast** - Powered by Whisper.cpp with GPU acceleration
 - 🎤 **System-wide** - Works in any application
-- 🔧 **Customizable** - Change hotkeys, models, and behavior
 
-## Quick Start
+## Installation
 
-### Installation
-
-1.  **Build the App:**
-    -   Follow the "Building from Source" instructions below to create the `hyprwhspr-installer.dmg`.
-2.  **Install the App:**
-    -   Open the `dist/hyprwhspr-installer.dmg` file.
-    -   Drag `hyprwhspr.app` to your `Applications` folder.
-
-### First Use
-
-1.  **Launch hyprwhspr:**
-    -   Open your `Applications` folder and double-click `hyprwhspr`.
-2.  **Grant Permissions:**
-    -   The first time you run the app, macOS will prompt you for:
-        -   **Microphone Access:** Required to capture your voice.
-        -   **Accessibility Access:** Required for the global hotkey (Globe/Fn key) to work.
-    -   Follow the on-screen instructions to grant both permissions.
-3.  **Start Dictation:**
-    -   Press the **Globe/Fn key** to start recording - *beep!*
-    -   Speak naturally.
-    -   Press the **Globe/Fn key** again to stop - *boop!*
-    -   Your transcribed text will appear in the active window.
-
-### Auto-start on Login (Optional)
-
-To have hyprwhspr launch automatically when you log in:
-
-1.  Open **System Settings** > **General** > **Login Items**.
-2.  Click the **+** button and add `hyprwhspr` from your `Applications` folder.
-
-## Configuration
-
-You can customize hyprwhspr by editing the configuration file located at:
-`~/Library/Application Support/hyprwhspr/config.json`
-
-(Note: The `config.json` file is created the first time you run the app.)
-
-### Change the Toggle Key
-
-```json
-{
-    "primary_shortcut": "fn"
-}
-```
-
-### Choose a Different Model
-
-Download additional models and place them in:
-`~/Library/Application Support/hyprwhspr/models/`
+1.  **Build and Install:**
+    -   Follow the "Building from Source" instructions below to create and install the application.
+2.  **First Run and Permissions:**
+    -   Follow the "First Run" instructions to open the app for the first time and grant the necessary permissions.
 
 ## Building from Source
 
-If you want to build the app and installer yourself:
+This is the standard way to build and install `hyprwhspr`.
 
 1.  **Clone the repository:**
     ```bash
     git clone https://github.com/goodroot/hyprwhspr.git
     cd hyprwhspr
     ```
-2.  **Run the build script:**
-    - This will create `hyprwhspr.app` in the `dist/` folder.
+
+2.  **Set up the build environment:**
+    -   This will create a local Python environment and install the necessary build tools.
     ```bash
-    ./scripts/build-macos.sh
+    python3 -m venv venv-build
+    source venv-build/bin/activate
+    pip install --upgrade pip
+    pip install -r requirements.txt
+    pip install pyinstaller create-dmg
     ```
-3.  **Create the DMG installer:**
-    - This will package the app into `hyprwhspr-installer.dmg` in the `dist/` folder.
+
+3.  **Build the application:**
+    -   This uses the `hyprwhspr.spec` file to create a valid macOS application bundle in the `dist/` folder.
+    ```bash
+    pyinstaller hyprwhspr.spec
+    ```
+
+4.  **Create the DMG installer:**
+    -   This packages the app into a professional DMG installer in the `dist/` folder.
     ```bash
     ./scripts/create-dmg.sh
     ```
-4.  **Install the app:**
-    - Open the newly created DMG and drag the app to your Applications folder.
+
+5.  **Install the application:**
+    -   Open the newly created DMG and drag the app to your Applications folder.
     ```bash
     open dist/hyprwhspr-installer.dmg
     ```
 
+## First Run (Important!)
+
+Because the application is not signed by a registered Apple Developer, you must follow these steps to run it for the first time.
+
+1.  **Open from the Finder:**
+    -   Go to your `Applications` folder.
+    -   **Right-click** (or Control-click) on `hyprwhspr.app` and select **Open** from the menu.
+2.  **Confirm You Want to Open:**
+    -   A dialog will appear warning you that the developer cannot be verified. This is expected.
+    -   Click the **Open** button to proceed.
+    -   You only need to do this once. After the first successful launch, you can open the app normally.
+3.  **Grant Permissions:**
+    -   The app will then prompt you for **Microphone** and **Accessibility** permissions. Please approve both.
+
+Once you've completed these steps, you can use the **Globe/Fn key** to toggle dictation.
+
 ## Uninstallation
 
 1.  Drag `hyprwhspr.app` from your `Applications` folder to the Trash.
-2.  (Optional) Remove the configuration and log files:
+2.  (Optional) Remove the configuration files:
     ```bash
     rm -rf "~/Library/Application Support/hyprwhspr"
     ```
-
-## Privacy
-
-All transcription happens locally on your Mac. No audio or text is sent to external servers. Your privacy is protected.
-
----
-
-**Built with ❤️ for macOS users**
-
-*Fast, private, local speech-to-text*
