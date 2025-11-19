@@ -1,14 +1,14 @@
 #!/bin/bash
 #
-# hyprwhspr installation script for macOS
-# This script sets up hyprwhspr for voice dictation with globe/fn key toggle
+# hyprwhspr build script for macOS
+# This script builds the hyprwhspr.app bundle and creates a DMG installer.
 #
 
-set -e  # Exit on error
+set -e # Exit on error
 
-echo "=================================="
-echo "hyprwhspr macOS Installation"
-echo "=================================="
+echo "======================================"
+echo "hyprwhspr macOS Build Script"
+echo "======================================"
 echo ""
 
 # Colors for output
@@ -41,44 +41,21 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REPO_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 
 echo ""
-echo "Installation directory: $REPO_DIR"
+echo "Project directory: $REPO_DIR"
 echo ""
-
-# Create installation directories
-INSTALL_DIR="$HOME/.local/share/hyprwhspr"
-CONFIG_DIR="$HOME/.config/hyprwhspr"
-MODEL_DIR="$HOME/.local/share/pywhispercpp/models"
-
-echo "Creating directories..."
-mkdir -p "$INSTALL_DIR"
-mkdir -p "$CONFIG_DIR"
-mkdir -p "$MODEL_DIR"
-mkdir -p "$INSTALL_DIR/temp"
-
-echo -e "${GREEN}✓${NC} Directories created"
-
-# Copy application files
-echo ""
-echo "Copying application files..."
-cp -r "$REPO_DIR/lib" "$INSTALL_DIR/"
-cp -r "$REPO_DIR/share" "$INSTALL_DIR/" 2>/dev/null || true
-
-echo -e "${GREEN}✓${NC} Application files copied"
 
 # Create and activate virtual environment
-echo ""
 echo "Setting up Python virtual environment..."
-VENV_DIR="$INSTALL_DIR/venv"
+VENV_DIR="$REPO_DIR/venv-build"
 
 if [ -d "$VENV_DIR" ]; then
-    echo "Removing existing virtual environment..."
-    rm -rf "$VENV_DIR"
+    echo "Using existing virtual environment."
+else
+    python3 -m venv "$VENV_DIR"
+    echo -e "${GREEN}✓${NC} Virtual environment created"
 fi
 
-python3 -m venv "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
-
-echo -e "${GREEN}✓${NC} Virtual environment created"
 
 # Upgrade pip
 echo ""
@@ -87,151 +64,67 @@ pip install --upgrade pip
 
 # Install dependencies
 echo ""
-echo "Installing Python dependencies..."
+echo "Installing build dependencies..."
 pip install -r "$REPO_DIR/requirements.txt"
+pip install py2app
 
 echo -e "${GREEN}✓${NC} Dependencies installed"
 
-# Download Whisper model
+# Build the application
 echo ""
-echo "Checking for Whisper model..."
-MODEL_FILE="$MODEL_DIR/ggml-base.en.bin"
+echo "Building hyprwhspr.app..."
+cd "$REPO_DIR"
+python3 setup.py py2app
 
-if [ -f "$MODEL_FILE" ]; then
-    echo -e "${GREEN}✓${NC} Whisper model already exists"
+if [ -d "dist/hyprwhspr.app" ]; then
+    echo -e "${GREEN}✓${NC} hyprwhspr.app built successfully"
 else
-    echo "Downloading Whisper base.en model (~148MB)..."
-    curl -L "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin" \
-         -o "$MODEL_FILE" \
-         --progress-bar
-
-    if [ -f "$MODEL_FILE" ]; then
-        echo -e "${GREEN}✓${NC} Model downloaded successfully"
-    else
-        echo -e "${YELLOW}WARNING: Failed to download model${NC}"
-        echo "You can manually download it later with:"
-        echo "  curl -L 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin' -o '$MODEL_FILE'"
-    fi
+    echo -e "${RED}ERROR: Failed to build hyprwhspr.app${NC}"
+    exit 1
 fi
 
-# Create default config
+# Create DMG installer
 echo ""
-echo "Creating configuration..."
-CONFIG_FILE="$CONFIG_DIR/config.json"
+echo "Creating DMG installer..."
+BUILD_DIR="$REPO_DIR/dist"
+DMG_NAME="hyprwhspr-installer.dmg"
+DMG_PATH="$BUILD_DIR/$DMG_NAME"
+APP_NAME="hyprwhspr.app"
 
-if [ ! -f "$CONFIG_FILE" ]; then
-    cat > "$CONFIG_FILE" << 'EOF'
-{
-  "primary_shortcut": "fn",
-  "model": "base.en",
-  "threads": 4,
-  "language": null,
-  "word_overrides": {},
-  "whisper_prompt": "Transcribe with proper capitalization, including sentence beginnings, proper nouns, titles, and standard English capitalization rules.",
-  "clipboard_behavior": false,
-  "clipboard_clear_delay": 5.0,
-  "paste_mode": "super",
-  "audio_feedback": true,
-  "start_sound_volume": 0.3,
-  "stop_sound_volume": 0.3
-}
-EOF
-    echo -e "${GREEN}✓${NC} Configuration file created"
-else
-    echo -e "${GREEN}✓${NC} Configuration file already exists"
+# Remove old DMG if it exists
+if [ -f "$DMG_PATH" ]; then
+    rm "$DMG_PATH"
 fi
 
-# Create launch script
-echo ""
-echo "Creating launch script..."
-LAUNCH_SCRIPT="$INSTALL_DIR/hyprwhspr-launch.sh"
+# Create a temporary directory for the DMG content
+DMG_CONTENT_DIR=$(mktemp -d)
+cp -R "$BUILD_DIR/$APP_NAME" "$DMG_CONTENT_DIR/"
+ln -s /Applications "$DMG_CONTENT_DIR/Applications"
 
-cat > "$LAUNCH_SCRIPT" << 'EOF'
-#!/bin/bash
-# hyprwhspr launcher for macOS
+# Create the DMG
+hdiutil create -volname "hyprwhspr" -srcfolder "$DMG_CONTENT_DIR" -ov -format UDZO "$DMG_PATH"
 
-INSTALL_DIR="$HOME/.local/share/hyprwhspr"
-VENV_DIR="$INSTALL_DIR/venv"
+# Clean up
+rm -rf "$DMG_CONTENT_DIR"
 
-# Activate virtual environment
-source "$VENV_DIR/bin/activate"
+if [ -f "$DMG_PATH" ]; then
+    echo -e "${GREEN}✓${NC} DMG installer created at: $DMG_PATH"
+else
+    echo -e "${RED}ERROR: Failed to create DMG installer${NC}"
+    exit 1
+fi
 
-# Run hyprwhspr
-cd "$INSTALL_DIR"
-python3 "$INSTALL_DIR/lib/main.py"
-EOF
+# Deactivate virtual environment
+deactivate
 
-chmod +x "$LAUNCH_SCRIPT"
-echo -e "${GREEN}✓${NC} Launch script created"
-
-# Create LaunchAgent plist for auto-start (optional)
-LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
-PLIST_FILE="$LAUNCH_AGENT_DIR/com.hyprwhspr.agent.plist"
-
-mkdir -p "$LAUNCH_AGENT_DIR"
-
-cat > "$PLIST_FILE" << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.hyprwhspr.agent</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$LAUNCH_SCRIPT</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>$HOME/Library/Logs/hyprwhspr.log</string>
-    <key>StandardErrorPath</key>
-    <string>$HOME/Library/Logs/hyprwhspr-error.log</string>
-</dict>
-</plist>
-EOF
-
-echo -e "${GREEN}✓${NC} LaunchAgent plist created"
-
-# Installation complete
 echo ""
-echo "=================================="
-echo -e "${GREEN}Installation Complete!${NC}"
-echo "=================================="
+echo "======================================"
+echo -e "${GREEN}Build Complete!${NC}"
+echo "======================================"
 echo ""
-echo "Important: Accessibility Permissions Required"
+echo "To install, open the DMG and drag hyprwhspr.app to your Applications folder:"
+echo "  open $DMG_PATH"
 echo ""
-echo "To use hyprwhspr, you need to grant accessibility permissions:"
-echo ""
-echo "  1. Open System Preferences > Security & Privacy > Privacy"
-echo "  2. Select 'Accessibility' from the left sidebar"
-echo "  3. Click the lock icon to make changes"
-echo "  4. Add Terminal (or your terminal app) to the list"
-echo "  5. Check the box next to it"
-echo ""
-echo "Usage:"
-echo ""
-echo "  Start manually:"
-echo "    $LAUNCH_SCRIPT"
-echo ""
-echo "  Start automatically on login:"
-echo "    launchctl load $PLIST_FILE"
-echo ""
-echo "  Stop auto-start:"
-echo "    launchctl unload $PLIST_FILE"
-echo ""
-echo "Configuration file:"
-echo "  $CONFIG_FILE"
-echo ""
-echo "Default toggle key: Globe/Fn key"
-echo ""
-echo "To change the toggle key, edit the config file and set 'primary_shortcut'"
-echo "Examples:"
-echo "  - 'fn' or 'globe' - Globe/Fn key (default)"
-echo "  - 'f12' - F12 key"
-echo "  - 'cmd+shift+d' - Command+Shift+D"
-echo ""
-echo -e "${GREEN}Press the Globe/Fn key to toggle dictation on/off!${NC}"
+echo "After installing, you can grant microphone and accessibility permissions"
+echo "by running the app and following the on-screen prompts."
 echo ""

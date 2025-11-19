@@ -5,6 +5,7 @@ Native speech-to-text dictation for macOS with **Globe/Fn key** toggle support.
 ## Features
 
 - 🎯 **Globe/Fn Key Toggle** - Press the globe (fn) key to start/stop dictation
+- 📦 **Easy Installation** - Simple DMG installer, just drag and drop
 - 🔒 **Private & Local** - All transcription happens on your Mac
 - ⚡ **Fast** - Powered by Whisper.cpp with GPU acceleration
 - 🎤 **System-wide** - Works in any application
@@ -12,65 +13,40 @@ Native speech-to-text dictation for macOS with **Globe/Fn key** toggle support.
 
 ## Quick Start
 
-### Prerequisites
-
-- **macOS 10.15 or later**
-- **Python 3.8+** (install via [python.org](https://www.python.org/downloads/macos/) or Homebrew)
-- **Accessibility Permissions** (required for global hotkeys)
-
 ### Installation
 
-```bash
-# Clone the repository
-git clone https://github.com/goodroot/hyprwhspr.git
-cd hyprwhspr
-
-# Run the automated installer
-./scripts/install-macos.sh
-```
-
-### Grant Accessibility Permissions
-
-**This is required for the globe key to work!**
-
-1. Open **System Preferences** > **Security & Privacy** > **Privacy**
-2. Select **Accessibility** from the left sidebar
-3. Click the 🔒 lock icon and enter your password
-4. Click the **+** button and add your **Terminal** app (or iTerm2, etc.)
-5. Check the box next to it
+1.  **Download the DMG:**
+    -   Go to the [releases page](https://github.com/goodroot/hyprwhspr/releases) and download the latest `hyprwhspr-installer.dmg`.
+2.  **Install the App:**
+    -   Open the DMG file.
+    -   Drag `hyprwhspr.app` to your `Applications` folder.
 
 ### First Use
 
-1. **Start hyprwhspr**:
-   ```bash
-   ~/.local/share/hyprwhspr/hyprwhspr-launch.sh
-   ```
+1.  **Launch hyprwhspr:**
+    -   Open your `Applications` folder and double-click `hyprwhspr`.
+2.  **Grant Permissions:**
+    -   The first time you run the app, macOS will prompt you for:
+        -   **Microphone Access:** Required to capture your voice.
+        -   **Accessibility Access:** Required for the global hotkey (Globe/Fn key) to work.
+    -   Follow the on-screen instructions to grant both permissions.
+3.  **Start Dictation:**
+    -   Press the **Globe/Fn key** to start recording - *beep!*
+    -   Speak naturally.
+    -   Press the **Globe/Fn key** again to stop - *boop!*
+    -   Your transcribed text will appear in the active window.
 
-2. **Press the Globe/Fn key** to start recording - *beep!*
+### Auto-start on Login (Optional)
 
-3. **Speak naturally**
+To have hyprwhspr launch automatically when you log in:
 
-4. **Press the Globe/Fn key again** to stop - *boop!*
-
-5. **Text appears in your active window!**
-
-### Auto-start on Login
-
-To start hyprwhspr automatically when you log in:
-
-```bash
-launchctl load ~/Library/LaunchAgents/com.hyprwhspr.agent.plist
-```
-
-To stop auto-start:
-
-```bash
-launchctl unload ~/Library/LaunchAgents/com.hyprwhspr.agent.plist
-```
+1.  Open **System Settings** > **General** > **Login Items**.
+2.  Click the **+** button and add `hyprwhspr` from your `Applications` folder.
 
 ## Configuration
 
-Edit `~/.config/hyprwhspr/config.json`:
+You can customize hyprwhspr by editing the configuration file located at:
+`~/Library/Application Support/hyprwhspr/config.json`
 
 ### Change the Toggle Key
 
@@ -102,20 +78,8 @@ Edit `~/.config/hyprwhspr/config.json`:
 - `"medium.en"` - High accuracy (~1.5GB)
 - `"large"` - Best accuracy, requires Apple Silicon or GPU (~3GB)
 
-Download additional models:
-
-```bash
-cd ~/.local/share/pywhispercpp/models/
-
-# Small model (better accuracy)
-curl -LO https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin
-
-# Medium model (high accuracy)
-curl -LO https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin
-
-# Large model (best accuracy, Apple Silicon recommended)
-curl -LO https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin
-```
+You can download additional models and place them in:
+`~/Library/Application Support/hyprwhspr/models/`
 
 ### Word Overrides
 
@@ -130,132 +94,62 @@ Customize how Whisper transcribes specific words:
 }
 ```
 
-### Audio Feedback
-
-Enable sound notifications:
-
-```json
-{
-    "audio_feedback": true,
-    "start_sound_volume": 0.3,
-    "stop_sound_volume": 0.3
-}
-```
-
 ## Troubleshooting
 
-### Globe key not working
+### Globe Key Not Working
 
-**Check accessibility permissions:**
+-   **Check Accessibility Permissions:**
+    1.  Go to **System Settings** > **Privacy & Security** > **Accessibility**.
+    2.  Make sure `hyprwhspr` is in the list and the toggle is enabled.
+    3.  If it's already enabled, try toggling it off and on again.
 
-1. System Preferences > Security & Privacy > Privacy > Accessibility
-2. Ensure your Terminal app is in the list and checked
-3. Try removing and re-adding it
-4. Restart hyprwhspr
+### No Audio Input
 
-**Alternative:** Use a different key combination:
+-   **Check Microphone Permissions:**
+    1.  Go to **System Settings** > **Privacy & Security** > **Microphone**.
+    2.  Ensure `hyprwhspr` is in the list and the toggle is enabled.
+-   **Check System Sound Settings:**
+    1.  Go to **System Settings** > **Sound** > **Input**.
+    2.  Select your preferred microphone and check the input level.
 
-```json
-{
-    "primary_shortcut": "cmd+shift+d"
-}
-```
+### Text Not Appearing
 
-### No audio input
-
-Check your microphone is selected:
-
-1. System Preferences > Sound > Input
-2. Select your microphone
-3. Test the input level
-4. Restart hyprwhspr
-
-### Text not appearing
-
-hyprwhspr uses **Cmd+V** to paste text. Make sure:
-
-1. The target application supports paste
-2. Cmd+V works normally in that app
-3. Check the logs for errors:
-   ```bash
-   tail -f ~/Library/Logs/hyprwhspr.log
-   ```
-
-### Whisper model not found
-
-Download the model manually:
-
-```bash
-cd ~/.local/share/pywhispercpp/models/
-curl -LO https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
-```
-
-## Uninstall
-
-```bash
-# Stop the service
-launchctl unload ~/Library/LaunchAgents/com.hyprwhspr.agent.plist
-
-# Remove files
-rm -rf ~/.local/share/hyprwhspr
-rm -rf ~/.config/hyprwhspr
-rm ~/Library/LaunchAgents/com.hyprwhspr.agent.plist
-rm ~/Library/Logs/hyprwhspr*.log
-```
-
-## Advanced Usage
-
-### Running from Command Line
-
-```bash
-# Activate the virtual environment
-source ~/.local/share/hyprwhspr/venv/bin/activate
-
-# Run hyprwhspr
-cd ~/.local/share/hyprwhspr
-python3 lib/main.py
-```
+-   hyprwhspr uses the clipboard and simulates **Cmd+V** to paste text. Make sure the target application supports pasting.
 
 ### Viewing Logs
 
-```bash
-# Real-time logs
-tail -f ~/Library/Logs/hyprwhspr.log
+Logs are stored at:
+-   `~/Library/Logs/hyprwhspr/hyprwhspr.log` (for general output)
+-   `~/Library/Logs/hyprwhspr/hyprwhspr-error.log` (for errors)
 
-# Error logs
-tail -f ~/Library/Logs/hyprwhspr-error.log
-```
+## Uninstalling
 
-### Manual Start/Stop
+1.  Drag `hyprwhspr.app` from your `Applications` folder to the Trash.
+2.  (Optional) Remove the configuration and log files:
+    ```bash
+    rm -rf "~/Library/Application Support/hyprwhspr"
+    rm -rf "~/Library/Logs/hyprwhspr"
+    ```
 
-```bash
-# Start
-launchctl start com.hyprwhspr.agent
+## Building from Source
 
-# Stop
-launchctl stop com.hyprwhspr.agent
+If you want to build the app yourself:
 
-# Status
-launchctl list | grep hyprwhspr
-```
-
-## GPU Acceleration
-
-hyprwhspr automatically uses Metal acceleration on Apple Silicon Macs for faster transcription. No configuration needed!
-
-For Intel Macs, CPU-only transcription is used. Consider using smaller models (`tiny.en` or `base.en`) for better performance.
+1.  **Clone the repository:**
+    ```bash
+    git clone https://github.com/goodroot/hyprwhspr.git
+    cd hyprwhspr
+    ```
+2.  **Run the build script:**
+    ```bash
+    ./scripts/install-macos.sh
+    ```
+3.  **Find the installer:**
+    -   The DMG will be in the `dist` folder.
 
 ## Privacy
 
 All transcription happens locally on your Mac. No audio or text is sent to external servers. Your privacy is protected.
-
-## License
-
-MIT License - see [LICENSE](LICENSE) file.
-
-## Contributing
-
-Issues and pull requests welcome! Please open an issue first to discuss major changes.
 
 ---
 
