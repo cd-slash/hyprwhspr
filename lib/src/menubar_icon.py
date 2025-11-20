@@ -42,12 +42,14 @@ class MenuBarApp(NSObject):
         self,
         toggle_callback: Optional[Callable] = None,
         quit_callback: Optional[Callable] = None,
-        permissions_ok: bool = False
+        accessibility_ok: bool = False,
+        microphone_ok: bool = False
     ):
         """Setup the menubar icon and menu"""
         self.toggle_callback = toggle_callback
         self.quit_callback = quit_callback
-        self.permissions_ok = permissions_ok
+        self.accessibility_ok = accessibility_ok
+        self.microphone_ok = microphone_ok
 
         # Create status bar item
         self.statusbar = NSStatusBar.systemStatusBar().statusItemWithLength_(
@@ -84,19 +86,35 @@ class MenuBarApp(NSObject):
         self.menu.addItem_(toggle_item)
 
         # Permissions status
-        if not permissions_ok:
+        if not accessibility_ok or not microphone_ok:
             self.menu.addItem_(NSMenuItem.separatorItem())
 
-            perm_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "⚠️  Accessibility Permissions Required", None, ""
-            )
-            self.menu.addItem_(perm_item)
+            if not accessibility_ok:
+                acc_perm_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    "⚠️  Accessibility Permissions Required", None, ""
+                )
+                self.menu.addItem_(acc_perm_item)
 
-            open_prefs_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "Open System Preferences...", "openAccessibilityPrefs:", ""
-            )
-            open_prefs_item.setTarget_(self)
-            self.menu.addItem_(open_prefs_item)
+                open_acc_prefs_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    "Open Accessibility Settings...", "openAccessibilityPrefs:", ""
+                )
+                open_acc_prefs_item.setTarget_(self)
+                self.menu.addItem_(open_acc_prefs_item)
+
+                if not microphone_ok:
+                    self.menu.addItem_(NSMenuItem.separatorItem())
+
+            if not microphone_ok:
+                mic_perm_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    "⚠️  Microphone Permissions Required", None, ""
+                )
+                self.menu.addItem_(mic_perm_item)
+
+                open_mic_prefs_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    "Open Microphone Settings...", "openMicrophonePrefs:", ""
+                )
+                open_mic_prefs_item.setTarget_(self)
+                self.menu.addItem_(open_mic_prefs_item)
 
         self.menu.addItem_(NSMenuItem.separatorItem())
 
@@ -155,6 +173,19 @@ class MenuBarApp(NSObject):
             # Fallback to general preferences
             subprocess.run(["open", "/System/Applications/System Preferences.app"])
 
+    def openMicrophonePrefs_(self, sender):
+        """Open System Preferences to Microphone settings"""
+        try:
+            # macOS Ventura and later
+            subprocess.run([
+                "open",
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+            ])
+        except Exception as e:
+            print(f"Error opening preferences: {e}")
+            # Fallback to general preferences
+            subprocess.run(["open", "/System/Applications/System Preferences.app"])
+
     def showAbout_(self, sender):
         """Show about dialog"""
         alert = NSAlert.alloc().init()
@@ -182,11 +213,12 @@ class MenuBarController:
         self,
         toggle_callback: Optional[Callable] = None,
         quit_callback: Optional[Callable] = None,
-        permissions_ok: bool = False
+        accessibility_ok: bool = False,
+        microphone_ok: bool = False
     ):
         self.app = NSApplication.sharedApplication()
         self.delegate = MenuBarApp.alloc().init()
-        self.delegate.setup_menubar(toggle_callback, quit_callback, permissions_ok)
+        self.delegate.setup_menubar(toggle_callback, quit_callback, accessibility_ok, microphone_ok)
 
     def update_recording_status(self, is_recording: bool):
         """Update the recording status"""
@@ -202,7 +234,8 @@ class MenuBarController:
 def create_menubar(
     toggle_callback: Optional[Callable] = None,
     quit_callback: Optional[Callable] = None,
-    permissions_ok: bool = False
+    accessibility_ok: bool = False,
+    microphone_ok: bool = False
 ) -> MenuBarController:
     """
     Create and return a menubar controller
@@ -210,9 +243,10 @@ def create_menubar(
     Args:
         toggle_callback: Function to call when user clicks toggle recording
         quit_callback: Function to call when user quits
-        permissions_ok: Whether accessibility permissions are granted
+        accessibility_ok: Whether accessibility permissions are granted
+        microphone_ok: Whether microphone permissions are granted
 
     Returns:
         MenuBarController instance
     """
-    return MenuBarController(toggle_callback, quit_callback, permissions_ok)
+    return MenuBarController(toggle_callback, quit_callback, accessibility_ok, microphone_ok)

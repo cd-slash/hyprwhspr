@@ -39,6 +39,7 @@ if PLATFORM == 'Darwin':  # macOS
     from text_injector_macos import TextInjector
     from global_shortcuts_macos import GlobalShortcuts, check_accessibility_permissions
     from menubar_icon import create_menubar
+    from macos_permissions import check_microphone_permission, request_microphone_permission
     from AppKit import NSApplication, NSTimer
     from PyObjCTools import AppHelper
 elif PLATFORM == 'Linux':
@@ -68,7 +69,8 @@ class hyprwhsprApp:
         self.text_injector = TextInjector(self.config)
         self.global_shortcuts = None
         self.menubar = None
-        self.permissions_ok = False
+        self.accessibility_ok = False
+        self.microphone_ok = False
 
         # Application state
         self.is_recording = False
@@ -76,12 +78,22 @@ class hyprwhsprApp:
         self.current_transcription = ""
         self.processing_start_time = None
 
-        # Check accessibility permissions on macOS
+        # Check permissions on macOS
         if PLATFORM == 'Darwin':
-            self.permissions_ok = check_accessibility_permissions()
-            if not self.permissions_ok:
+            print("\n🔒 Checking permissions...")
+            self.accessibility_ok = check_accessibility_permissions()
+            self.microphone_ok = check_microphone_permission()
+
+            if not self.accessibility_ok:
                 print("\n⚠️  WARNING: Accessibility permissions not granted!")
                 print("The global hotkey will not work until you grant permissions.")
+
+            if not self.microphone_ok:
+                print("\n⚠️  WARNING: Microphone permissions not granted!")
+                print("Recording will not work until you grant permissions.")
+                print("Attempting to request microphone permission...")
+                # Try to request permission
+                self.microphone_ok = request_microphone_permission()
 
         # Set up global shortcuts (needed for headless operation)
         self._setup_global_shortcuts()
@@ -265,7 +277,8 @@ class hyprwhsprApp:
             self.menubar = create_menubar(
                 toggle_callback=self._on_shortcut_triggered,
                 quit_callback=self._cleanup,
-                permissions_ok=self.permissions_ok
+                accessibility_ok=self.accessibility_ok,
+                microphone_ok=self.microphone_ok
             )
             print("✅ Menubar icon created", flush=True)
 

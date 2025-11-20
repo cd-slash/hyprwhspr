@@ -6,7 +6,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('lib/src', 'lib/src'), ('share/assets', 'share/assets')],
-    hiddenimports=['objc', 'Cocoa', 'Quartz', 'pywhispercpp', 'pywhispercpp.model', 'pywhispercpp.constants', 'pywhispercpp.utils', 'sounddevice', 'scipy', 'numpy', 'pyperclip', 'rich', 'wave'],
+    hiddenimports=['objc', 'Cocoa', 'Quartz', 'AVFoundation', 'pywhispercpp', 'pywhispercpp.model', 'pywhispercpp.constants', 'pywhispercpp.utils', 'sounddevice', 'scipy', 'numpy', 'pyperclip', 'rich', 'wave'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -46,5 +46,10 @@ app = BUNDLE(
     coll,
     name='hyprwhspr.app',
     icon=None,
-    bundle_identifier=None,
+    bundle_identifier='com.hyprwhspr.app',
+    info_plist={
+        'NSMicrophoneUsageDescription': 'hyprwhspr needs access to your microphone to capture your voice for transcription.',
+        'LSUIElement': True,
+        'NSHighResolutionCapable': True,
+    },
 )
