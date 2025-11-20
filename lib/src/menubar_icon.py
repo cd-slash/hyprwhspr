@@ -43,13 +43,15 @@ class MenuBarApp(NSObject):
         toggle_callback: Optional[Callable] = None,
         quit_callback: Optional[Callable] = None,
         accessibility_ok: bool = False,
-        microphone_ok: bool = False
+        microphone_ok: bool = False,
+        hotkey: str = 'cmd+shift+d'
     ):
         """Setup the menubar icon and menu"""
         self.toggle_callback = toggle_callback
         self.quit_callback = quit_callback
         self.accessibility_ok = accessibility_ok
         self.microphone_ok = microphone_ok
+        self.hotkey = hotkey
 
         # Create status bar item
         self.statusbar = NSStatusBar.systemStatusBar().statusItemWithLength_(
@@ -79,8 +81,9 @@ class MenuBarApp(NSObject):
         self.menu.addItem_(NSMenuItem.separatorItem())
 
         # Toggle recording
+        hotkey_display = self.hotkey.replace('cmd', '⌘').replace('shift', '⇧').replace('ctrl', '⌃').replace('alt', '⌥').replace('option', '⌥').replace('+', '')
         toggle_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Toggle Recording (fn)", "toggleRecording:", ""
+            f"Toggle Recording ({hotkey_display})", "toggleRecording:", ""
         )
         toggle_item.setTarget_(self)
         self.menu.addItem_(toggle_item)
@@ -214,11 +217,12 @@ class MenuBarController:
         toggle_callback: Optional[Callable] = None,
         quit_callback: Optional[Callable] = None,
         accessibility_ok: bool = False,
-        microphone_ok: bool = False
+        microphone_ok: bool = False,
+        hotkey: str = 'cmd+shift+d'
     ):
         self.app = NSApplication.sharedApplication()
         self.delegate = MenuBarApp.alloc().init()
-        self.delegate.setup_menubar(toggle_callback, quit_callback, accessibility_ok, microphone_ok)
+        self.delegate.setup_menubar(toggle_callback, quit_callback, accessibility_ok, microphone_ok, hotkey)
 
     def update_recording_status(self, is_recording: bool):
         """Update the recording status"""
@@ -235,7 +239,8 @@ def create_menubar(
     toggle_callback: Optional[Callable] = None,
     quit_callback: Optional[Callable] = None,
     accessibility_ok: bool = False,
-    microphone_ok: bool = False
+    microphone_ok: bool = False,
+    hotkey: str = 'cmd+shift+d'
 ) -> MenuBarController:
     """
     Create and return a menubar controller
@@ -245,8 +250,9 @@ def create_menubar(
         quit_callback: Function to call when user quits
         accessibility_ok: Whether accessibility permissions are granted
         microphone_ok: Whether microphone permissions are granted
+        hotkey: The configured hotkey combination to display
 
     Returns:
         MenuBarController instance
     """
-    return MenuBarController(toggle_callback, quit_callback, accessibility_ok, microphone_ok)
+    return MenuBarController(toggle_callback, quit_callback, accessibility_ok, microphone_ok, hotkey)

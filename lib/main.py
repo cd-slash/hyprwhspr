@@ -101,12 +101,21 @@ class hyprwhsprApp:
     def _setup_global_shortcuts(self):
         """Initialize global keyboard shortcuts"""
         try:
-            shortcut_key = self.config.get_setting('primary_shortcut', 'Super+Alt+D')
+            # Platform-specific defaults
+            if PLATFORM == 'Darwin':
+                default_key = 'fn'
+            else:
+                default_key = 'Super+Alt+D'
+
+            shortcut_key = self.config.get_setting('primary_shortcut', default_key)
+
             self.global_shortcuts = GlobalShortcuts(shortcut_key, self._on_shortcut_triggered)
+            self.configured_shortcut = shortcut_key
             print(f"🎯 Global shortcut configured: {shortcut_key}")
         except Exception as e:
             print(f"❌ Failed to initialize global shortcuts: {e}")
             self.global_shortcuts = None
+            self.configured_shortcut = None
 
     def _on_shortcut_triggered(self):
         """Handle global shortcut trigger"""
@@ -242,33 +251,26 @@ class hyprwhsprApp:
             print("🚀 Starting hyprwhspr...")
 
             # Initialize whisper manager
-            print("DEBUG: About to initialize whisper...", flush=True)
-            init_result = self.whisper_manager.initialize()
-            print(f"DEBUG: Whisper init returned: {init_result}", flush=True)
-
-            if not init_result:
-                print("❌ Failed to initialize Whisper. Please ensure whisper.cpp is built.", flush=True)
-                print("Run the build scripts first.", flush=True)
+            if not self.whisper_manager.initialize():
+                print("❌ Failed to initialize Whisper. Please ensure whisper.cpp is built.")
+                print("Run the build scripts first.")
                 return False
 
-            print("✅ hyprwhspr initialized successfully", flush=True)
-            print("🎤 Listening for global shortcuts...", flush=True)
+            print("✅ hyprwhspr initialized successfully")
+            print("🎤 Listening for global shortcuts...")
         except Exception as e:
-            print(f"❌ Error in run() before shortcuts: {e}", flush=True)
+            print(f"❌ Error in run() before shortcuts: {e}")
             import traceback
             traceback.print_exc()
             return False
 
         # Start global shortcuts
         if self.global_shortcuts:
-            print("DEBUG: About to start global shortcuts", flush=True)
             self.global_shortcuts.start()
-            print("DEBUG: Global shortcuts started, continuing...", flush=True)
 
         # Setup menubar on macOS
         if PLATFORM == 'Darwin':
-            print("DEBUG: Reached macOS section", flush=True)
-            print("🖥️  Setting up menubar icon...", flush=True)
+            print("🖥️  Setting up menubar icon...")
 
             # Activate the application
             app = NSApplication.sharedApplication()
@@ -278,16 +280,16 @@ class hyprwhsprApp:
                 toggle_callback=self._on_shortcut_triggered,
                 quit_callback=self._cleanup,
                 accessibility_ok=self.accessibility_ok,
-                microphone_ok=self.microphone_ok
+                microphone_ok=self.microphone_ok,
+                hotkey=getattr(self, 'configured_shortcut', 'fn')
             )
-            print("✅ Menubar icon created", flush=True)
+            print("✅ Menubar icon created")
 
             # Use Cocoa event loop for macOS
             try:
-                print("DEBUG: Starting Cocoa event loop...", flush=True)
                 AppHelper.runEventLoop()
             except KeyboardInterrupt:
-                print("\n🛑 Shutting down hyprwhspr...", flush=True)
+                print("\n🛑 Shutting down hyprwhspr...")
                 self._cleanup()
         else:
             # Linux: use simple event loop

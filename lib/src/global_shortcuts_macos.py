@@ -186,9 +186,6 @@ class GlobalShortcuts:
         # Parse the primary key combination
         self.target_keycode, self.target_modifiers = self._parse_key_combination(primary_key)
 
-        print(f"Global shortcuts initialized with key: {primary_key}")
-        print(f"Parsed: keycode={self.target_keycode}, modifiers={self.target_modifiers}")
-
     def _parse_key_combination(self, key_string: str):
         """Parse a key combination string into keycode and modifiers"""
         modifiers = set()
@@ -259,12 +256,15 @@ class GlobalShortcuts:
                     # On macOS, Fn key presses come as flags changed events
                     # Check if this is an Fn key event
                     if keycode == KeyCode.FUNCTION:
+                        print(f"[FN KEY] Event detected: keycode={keycode}, has_fn_flag={bool(flags & kCGEventFlagMaskSecondaryFn)}", flush=True)
                         if flags & kCGEventFlagMaskSecondaryFn:
                             # Fn key pressed
+                            print("[FN KEY] Fn key PRESSED", flush=True)
                             self.pressed_keys.add(keycode)
                             self._check_shortcut_combination(keycode, current_modifiers)
                         else:
                             # Fn key released
+                            print("[FN KEY] Fn key RELEASED", flush=True)
                             self.pressed_keys.discard(keycode)
 
                 # Always pass through the event
