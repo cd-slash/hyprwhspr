@@ -199,7 +199,12 @@ class GlobalShortcuts:
                         return
                     device.close()
                     continue
-                
+
+                # Skip mice and other non-keyboard devices (unless explicitly selected)
+                if not self.selected_device_path and not self._is_keyboard_device(device):
+                    device.close()
+                    continue
+
                 # Check that device can emit ALL keys required for the shortcut
                 available_keys = set(capabilities[ecodes.EV_KEY])
                 if not self.target_keys.issubset(available_keys):
@@ -281,11 +286,49 @@ class GlobalShortcuts:
                 # This shouldn't happen if we handled all cases above, but just in case
                 print(f"[ERROR] Selected device {self.selected_device_path} could not be initialized")
             else:
-                print("[ERROR] No accessible devices found that can emit the configured shortcut!")
+                print("[ERROR] No accessible keyboard devices found!")
                 print("[ERROR] Solutions:")
                 print("[ERROR]   1. Add yourself to 'input' group: sudo usermod -aG input $USER")
-                print("[ERROR]   2. Disable key grabbing in config (grab_keys: false)")
-                print(f"[ERROR]   3. Check that your shortcut '{self.primary_key}' uses keys available on your keyboard")
+                print("[ERROR]   2. Run with sudo: sudo hyprwhspr")
+                print("[ERROR]   3. Disable key grabbing in config (grab_keys: false)")
+
+    def _is_keyboard_device(self, device: InputDevice) -> bool:
+        """Check if a device is a keyboard by testing for common keyboard keys"""
+        capabilities = device.capabilities()
+
+        # Check if device has EV_KEY events
+        if ecodes.EV_KEY not in capabilities:
+            return False
+
+        # Exclude mice by name (most reliable method for Logitech unified receivers)
+        # Logitech unified receivers report the same capabilities for all devices,
+        # so we need to use the device name to distinguish keyboards from mice
+        device_name_lower = device.name.lower()
+        mouse_keywords = [
+            'mouse', 'trackball', 'pointer', 'touchpad',
+            # Logitech mouse model names that don't contain "mouse"
+            'mx master', 'mx anywhere', 'mx ergo', 'mx vertical',
+            'g502', 'g602', 'g604', 'g703', 'g903', 'gpro',  # Logitech G series mice
+        ]
+        if any(keyword in device_name_lower for keyword in mouse_keywords):
+            return False
+
+        keys = capabilities[ecodes.EV_KEY]
+
+        # Also exclude devices with mouse buttons but NO keyboard keys
+        # (catches mice that don't have "mouse" in their name)
+        mouse_buttons = [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE]
+        keyboard_keys = [ecodes.KEY_A, ecodes.KEY_S, ecodes.KEY_D, ecodes.KEY_F]
+
+        has_mouse_buttons = any(btn in keys for btn in mouse_buttons)
+        has_keyboard_keys = any(key in keys for key in keyboard_keys)
+
+        # If it has mouse buttons but no keyboard keys, it's definitely a mouse
+        if has_mouse_buttons and not has_keyboard_keys:
+            return False
+
+        # Must have keyboard keys to be considered a keyboard
+        return has_keyboard_keys
     
     def _parse_key_combination(self, key_string: str) -> Set[int]:
         """Parse a key combination string into a set of evdev key codes"""
@@ -831,7 +874,31 @@ def get_available_keyboards(shortcut: Optional[str] = None) -> List[Dict[str, st
             if ecodes.EV_KEY not in capabilities:
                 device.close()
                 continue
-            
+
+            # Exclude mice by name
+            device_name_lower = device.name.lower()
+            mouse_keywords = [
+                'mouse', 'trackball', 'pointer', 'touchpad',
+                'mx master', 'mx anywhere', 'mx ergo', 'mx vertical',
+                'g502', 'g602', 'g604', 'g703', 'g903', 'gpro',
+            ]
+            if any(keyword in device_name_lower for keyword in mouse_keywords):
+                device.close()
+                continue
+
+            # Check for common keyboard keys
+            keys = capabilities[ecodes.EV_KEY]
+            keyboard_keys = [ecodes.KEY_A, ecodes.KEY_S, ecodes.KEY_D, ecodes.KEY_F]
+            mouse_buttons = [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE]
+
+            has_mouse_buttons = any(btn in keys for btn in mouse_buttons)
+            has_keyboard_keys = any(key in keys for key in keyboard_keys)
+
+            # Exclude devices with mouse buttons but no keyboard keys
+            if has_mouse_buttons and not has_keyboard_keys:
+                device.close()
+                continue
+
             available_keys = set(capabilities[ecodes.EV_KEY])
             
             # If shortcut is provided, check that device can emit all required keys
