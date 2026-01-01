@@ -629,14 +629,24 @@ class GlobalShortcuts:
 
     def _setup_key_grabbing(self) -> bool:
         """Set up UInput virtual keyboard and grab physical devices
-        
+
         Returns:
             True if at least one device was grabbed, False otherwise
         """
         try:
-            # Create a virtual keyboard that can emit all key events
-            # This will re-emit keys that aren't part of our shortcut
-            self.uinput = UInput(name="hyprwhspr-virtual-keyboard")
+            # Collect all key capabilities from devices we're about to grab
+            # This ensures the virtual keyboard can emit any key the physical keyboards can
+            all_keys = set()
+            for device in self.devices:
+                caps = device.capabilities()
+                if ecodes.EV_KEY in caps:
+                    all_keys.update(caps[ecodes.EV_KEY])
+
+            # Create a virtual keyboard with combined capabilities from all devices
+            self.uinput = UInput(
+                events={ecodes.EV_KEY: list(all_keys)},
+                name="hyprwhspr-virtual-keyboard"
+            )
 
             # Grab all keyboard devices to intercept their events
             # Use retry logic to handle cases where devices are temporarily busy (e.g., during service restart)
