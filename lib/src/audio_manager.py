@@ -21,8 +21,8 @@ class AudioManager:
             self.enabled = self.config_manager.get_setting('audio_feedback', False)  # Default to disabled
             # General audio volume (fallback for _play_sound when volume=None)
             self.volume = self.config_manager.get_setting('audio_volume', 0.5)  # Default 50% volume
-            self.start_volume = self.config_manager.get_setting('start_sound_volume', 0.5)
-            self.stop_volume = self.config_manager.get_setting('stop_sound_volume', 0.5)
+            self.start_volume = self.config_manager.get_setting('start_sound_volume', 1.0)
+            self.stop_volume = self.config_manager.get_setting('stop_sound_volume', 1.0)
             self.error_volume = self.config_manager.get_setting('error_sound_volume', 0.5)
             self.start_sound_path = self.config_manager.get_setting('start_sound_path', None)
             self.stop_sound_path = self.config_manager.get_setting('stop_sound_path', None)
@@ -30,8 +30,8 @@ class AudioManager:
         else:
             self.enabled = False  # Default to disabled
             self.volume = 0.5  
-            self.start_volume = 0.5
-            self.stop_volume = 0.5
+            self.start_volume = 1.0
+            self.stop_volume = 1.0
             self.error_volume = 0.5
             self.start_sound_path = None
             self.stop_sound_path = None
@@ -56,56 +56,10 @@ class AudioManager:
             if not self.assets_dir.exists():
                 self.assets_dir = Path(__file__).parent.parent / "assets"
         
-        # Start sound path resolution
-        if self.start_sound_path:
-            # Try the path as-is first (for absolute paths)
-            start_path = Path(self.start_sound_path)
-            if start_path.exists():
-                self.start_sound = start_path
-            else:
-                # Try relative to assets directory (for relative paths like "ping-up.ogg")
-                start_path = self.assets_dir / self.start_sound_path
-                if start_path.exists():
-                    self.start_sound = start_path
-                else:
-                    # Fall back to default
-                    self.start_sound = self.assets_dir / "ping-up.ogg"
-        else:
-            self.start_sound = self.assets_dir / "ping-up.ogg"
-        
-        # Stop sound path resolution
-        if self.stop_sound_path:
-            # Try the path as-is first (for absolute paths)
-            stop_path = Path(self.stop_sound_path)
-            if stop_path.exists():
-                self.stop_sound = stop_path
-            else:
-                # Try relative to assets directory (for relative paths like "ping-down.ogg")
-                stop_path = self.assets_dir / self.stop_sound_path
-                if stop_path.exists():
-                    self.stop_sound = stop_path
-                else:
-                    # Fall back to default
-                    self.stop_sound = self.assets_dir / "ping-down.ogg"
-        else:
-            self.stop_sound = self.assets_dir / "ping-down.ogg"
-
-        # Error sound path resolution
-        if self.error_sound_path:
-            # Try the path as-is first (for absolute paths)
-            error_path = Path(self.error_sound_path)
-            if error_path.exists():
-                self.error_sound = error_path
-            else:
-                # Try relative to assets directory (for relative paths like "ping-error.ogg")
-                error_path = self.assets_dir / self.error_sound_path
-                if error_path.exists():
-                    self.error_sound = error_path
-                else:
-                    # Fall back to default
-                    self.error_sound = self.assets_dir / "ping-error.ogg"
-        else:
-            self.error_sound = self.assets_dir / "ping-error.ogg"
+        # Resolve sound paths (custom path -> relative to assets -> default)
+        self.start_sound = self._resolve_sound_path(self.start_sound_path, "ping-up.ogg")
+        self.stop_sound = self._resolve_sound_path(self.stop_sound_path, "ping-down.ogg")
+        self.error_sound = self._resolve_sound_path(self.error_sound_path, "ping-error.ogg")
 
         # Check if audio files exist
         self.start_sound_available = self.start_sound.exists()
@@ -127,11 +81,29 @@ class AudioManager:
             volume = float(volume)
         except (ValueError, TypeError):
             volume = 0.3
-        
+
         # Clamp between 0.1 (10%) and 1.0 (100%)
         volume = max(0.1, min(volume, 1.0))
         return volume
-    
+
+    def _resolve_sound_path(self, custom_path: Optional[str], default_filename: str) -> Path:
+        """
+        Resolve a sound file path with fallback logic.
+
+        Tries: custom_path as-is -> custom_path relative to assets -> default
+        """
+        if custom_path:
+            # Try as absolute path first
+            path = Path(custom_path)
+            if path.exists():
+                return path
+            # Try relative to assets directory
+            path = self.assets_dir / custom_path
+            if path.exists():
+                return path
+        # Fall back to default
+        return self.assets_dir / default_filename
+
     def _play_sound(self, sound_file: Path, volume: float = None) -> bool:
         """
         Play an audio file with volume control
@@ -152,17 +124,17 @@ class AudioManager:
         
         try:
             # Try using ffplay (most reliable, supports volume control)
-            if self._is_ffplay_available():
+            if self._is_tool_available('ffplay'):
                 return self._play_with_ffplay(sound_file, volume)
-            
+
             # Fallback to aplay (ALSA, no volume control)
-            elif self._is_aplay_available():
+            elif self._is_tool_available('aplay'):
                 return self._play_with_aplay(sound_file)
-            
+
             # Fallback to paplay (PulseAudio, no volume control)
-            elif self._is_paplay_available():
+            elif self._is_tool_available('paplay'):
                 return self._play_with_paplay(sound_file)
-            
+
             else:
                 print("No audio playback tools available (ffplay, aplay, or paplay)")
                 return False
@@ -171,123 +143,77 @@ class AudioManager:
             print(f"Failed to play audio: {e}")
             return False
     
-    def _is_ffplay_available(self) -> bool:
-        """Check if ffplay is available"""
+    def _is_tool_available(self, tool_name: str) -> bool:
+        """Check if a command-line tool is available"""
         try:
-            result = subprocess.run(['which', 'ffplay'], capture_output=True, text=True, timeout=5)
+            result = subprocess.run(['which', tool_name], capture_output=True, text=True, timeout=5)
             return result.returncode == 0
         except Exception:
             return False
-    
-    def _is_aplay_available(self) -> bool:
-        """Check if aplay is available"""
+
+    def _run_audio_command(self, cmd: list, tool_name: str) -> bool:
+        """Run an audio command in a background thread"""
         try:
-            result = subprocess.run(['which', 'aplay'], capture_output=True, text=True, timeout=5)
-            return result.returncode == 0
-        except Exception:
+            def play_audio():
+                subprocess.run(cmd, capture_output=True, timeout=5)
+
+            thread = threading.Thread(target=play_audio, daemon=True)
+            thread.start()
+            return True
+        except Exception as e:
+            print(f"{tool_name} failed: {e}")
             return False
-    
-    def _is_paplay_available(self) -> bool:
-        """Check if paplay is available"""
-        try:
-            result = subprocess.run(['which', 'paplay'], capture_output=True, text=True, timeout=5)
-            return result.returncode == 0
-        except Exception:
-            return False
-    
+
     def _play_with_ffplay(self, sound_file: Path, volume: float) -> bool:
         """Play audio with ffplay (supports volume control)"""
-        try:
-            # Convert volume from 0.1-1.0 to ffplay's -volume (0-100)
-            ffplay_volume = int(volume * 100)
-            
-            cmd = [
-                'ffplay', 
-                '-nodisp',  # No display window
-                '-autoexit',  # Exit after playing
-                '-volume', str(ffplay_volume),
-                '-loglevel', 'error',  # Minimal logging
-                str(sound_file)
-            ]
-            
-            # Run in background thread to avoid blocking
-            def play_audio():
-                subprocess.run(cmd, capture_output=True, timeout=5)
-            
-            thread = threading.Thread(target=play_audio, daemon=True)
-            thread.start()
-            return True
-            
-        except Exception as e:
-            print(f"ffplay failed: {e}")
-            return False
-    
+        # Convert volume from 0.1-1.0 to ffplay's -volume (0-100)
+        ffplay_volume = int(volume * 100)
+        cmd = [
+            'ffplay',
+            '-nodisp',  # No display window
+            '-autoexit',  # Exit after playing
+            '-volume', str(ffplay_volume),
+            '-loglevel', 'error',  # Minimal logging
+            str(sound_file)
+        ]
+        return self._run_audio_command(cmd, 'ffplay')
+
     def _play_with_aplay(self, sound_file: Path) -> bool:
         """Play audio with aplay (ALSA, no volume control)"""
-        try:
-            cmd = ['aplay', '-q', str(sound_file)]
-            
-            def play_audio():
-                subprocess.run(cmd, capture_output=True, timeout=5)
-            
-            thread = threading.Thread(target=play_audio, daemon=True)
-            thread.start()
-            return True
-            
-        except Exception as e:
-            print(f"aplay failed: {e}")
-            return False
-    
+        return self._run_audio_command(['aplay', '-q', str(sound_file)], 'aplay')
+
     def _play_with_paplay(self, sound_file: Path) -> bool:
         """Play audio with paplay (PulseAudio, no volume control)"""
-        try:
-            cmd = ['paplay', str(sound_file)]
-            
-            def play_audio():
-                subprocess.run(cmd, capture_output=True, timeout=5)
-            
-            thread = threading.Thread(target=play_audio, daemon=True)
-            thread.start()
-            return True
-            
-        except Exception as e:
-            print(f"paplay failed: {e}")
-            return False
+        return self._run_audio_command(['paplay', str(sound_file)], 'paplay')
     
     def play_start_sound(self) -> bool:
         """Play the recording start sound"""
-        print(f"🔊 play_start_sound called - enabled: {self.enabled}, available: {self.start_sound_available}")
         if not self.enabled or not self.start_sound_available:
-            print(f"❌ Start sound blocked - enabled: {self.enabled}, available: {self.start_sound_available}")
             return False
         
-        print(f"🔊 Playing start sound: {self.start_sound} (volume: {self.start_volume})")
         result = self._play_sound(self.start_sound, self.start_volume)
-        print(f"🔊 Start sound result: {'Success' if result else 'Failed'}")
+        if not result:
+            print(f"Failed to play start sound: {self.start_sound}")
         return result
     
     def play_stop_sound(self) -> bool:
         """Play the recording stop sound"""
-        print(f"🔊 play_stop_sound called - enabled: {self.enabled}, available: {self.stop_sound_available}")
         if not self.enabled or not self.stop_sound_available:
-            print(f"❌ Stop sound blocked - enabled: {self.enabled}, available: {self.stop_sound_available}")
             return False
 
-        print(f"🔊 Playing stop sound: {self.stop_sound} (volume: {self.stop_volume})")
         result = self._play_sound(self.stop_sound, self.stop_volume)
-        print(f"🔊 Stop sound result: {'Success' if result else 'Failed'}")
+        if not result:
+            print(f"Failed to play stop sound: {self.stop_sound}")
         return result
 
     def play_error_sound(self) -> bool:
         """Play the error sound (e.g., for blank audio or failed transcription)"""
-        print(f"🔊 play_error_sound called - enabled: {self.enabled}, available: {self.error_sound_available}")
         if not self.enabled or not self.error_sound_available:
-            print(f"❌ Error sound blocked - enabled: {self.enabled}, available: {self.error_sound_available}")
             return False
 
-        print(f"🔊 Playing error sound: {self.error_sound} (volume: {self.error_volume})")
         result = self._play_sound(self.error_sound, self.error_volume)
-        print(f"🔊 Error sound result: {'Success' if result else 'Failed'}")
+        if not result:
+            print(f"Failed to play error sound: {self.error_sound}")
         return result
 
     def set_audio_feedback(self, enabled: bool):

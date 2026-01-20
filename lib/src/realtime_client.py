@@ -45,6 +45,7 @@ class RealtimeClient:
         self.model = None
         self.instructions = None
         self.mode = mode
+        self.language = None  # Language code for transcription (None = auto-detect)
         
         # Connection state
         self.connected = False
@@ -71,6 +72,10 @@ class RealtimeClient:
         
         # Threading
         self.lock = threading.Lock()
+
+        # Track if buffer was committed (by VAD or manual)
+        # Prevents double-commit error when VAD auto-commits on speech end
+        self._buffer_committed = False
         
     def connect(self, url: str, api_key: str, model: str, instructions: Optional[str] = None) -> bool:
         """
@@ -203,39 +208,47 @@ class RealtimeClient:
         # Response events (conversational API)
         elif event_type == 'response.created':
             print(f'[REALTIME] Response created', flush=True)
-            self.current_response_text = ""
-            self.response_complete = False
+            with self.lock:
+                self.current_response_text = ""
+                self.response_complete = False
             self.response_event.clear()
         
         elif event_type == 'response.output_text.delta':
             # Accumulate text deltas
             delta = event.get('delta', '')
             if delta:
-                self.current_response_text += delta
+                with self.lock:
+                    self.current_response_text += delta
         
         elif event_type == 'response.output_text.done':
             # Final text available
             text = event.get('text', '')
-            if text:
-                self.current_response_text = text
-            print(f'[REALTIME] Response text done ({len(self.current_response_text)} chars)', flush=True)
-        
+            with self.lock:
+                if text:
+                    self.current_response_text = text
+                text_len = len(self.current_response_text)
+            print(f'[REALTIME] Response text done ({text_len} chars)', flush=True)
+
         elif event_type == 'response.done':
             # Response complete
-            self.response_complete = True
+            with self.lock:
+                self.response_complete = True
             self.response_event.set()
             print(f'[REALTIME] Response done', flush=True)
         
         # Transcription events (fallback/alternative)
         elif event_type == 'conversation.item.input_audio_transcription.completed':
             transcript = event.get('transcript', '')
-            self.current_response_text = transcript
-            self.response_complete = True
+            with self.lock:
+                self.current_response_text = transcript
+                self.response_complete = True
             self.response_event.set()
-            print(f'[REALTIME] Transcription completed ({len(self.current_response_text)} chars)', flush=True)
+            print(f'[REALTIME] Transcription completed ({len(transcript)} chars)', flush=True)
         
         elif event_type == 'input_audio_buffer.committed':
             print(f'[REALTIME] Audio buffer committed', flush=True)
+            with self.lock:
+                self._buffer_committed = True
         
         elif event_type == 'input_audio_buffer.speech_started':
             print(f'[REALTIME] Speech detected', flush=True)
@@ -257,6 +270,8 @@ class RealtimeClient:
         
         if self.mode == 'transcribe':
             # Transcription-only session
+            # Use stored language if set, otherwise default to 'en' (or None for auto-detect)
+            transcription_language = self.language if self.language is not None else 'en'
             session_data = {
                 'type': 'transcription',
                 'audio': {
@@ -267,7 +282,7 @@ class RealtimeClient:
                         },
                         'transcription': {
                             'model': 'gpt-4o-mini-transcribe',
-                            'language': 'en'
+                            'language': transcription_language
                         },
                         'turn_detection': {
                             'type': 'server_vad',
@@ -305,6 +320,16 @@ class RealtimeClient:
             print(f'[REALTIME] Sent session.update', flush=True)
         except Exception as e:
             print(f'[REALTIME] Failed to send session.update: {e}', flush=True)
+    
+    def update_language(self, language: Optional[str]):
+        """Update the language for transcription and resend session.update
+        
+        Args:
+            language: Language code (e.g., 'en', 'it', 'fr') or None for auto-detect
+        """
+        self.language = language
+        if self.connected:
+            self._send_session_update()
     
     def _attempt_reconnect(self):
         """Attempt to reconnect with exponential backoff"""
@@ -344,6 +369,8 @@ class RealtimeClient:
             event = {'type': 'input_audio_buffer.clear'}
             self.ws.send(json.dumps(event))
             self.audio_buffer_seconds = 0.0
+            with self.lock:
+                self._buffer_committed = False  # Reset commit tracking for new recording
         except Exception as e:
             print(f'[REALTIME] Failed to clear buffer: {e}', flush=True)
     
@@ -387,30 +414,55 @@ class RealtimeClient:
     def commit_and_get_text(self, timeout: float = 30.0) -> str:
         """
         Commit audio buffer and wait for transcription result.
-        
+
         With server VAD enabled, transcription happens automatically when speech ends.
         This method commits any remaining audio and waits for the transcript.
-        
+
         Args:
             timeout: Maximum time to wait for transcription (seconds)
-        
+
         Returns:
             Final transcript text, or empty string on timeout/error
         """
         if not self.connected or not self.ws:
             print('[REALTIME] Not connected, cannot commit', flush=True)
             return ""
-        
+
         try:
-            # Reset response state
-            self.current_response_text = ""
-            self.response_complete = False
-            self.response_event.clear()
-            
-            # Send input_audio_buffer.commit
-            commit_event = {'type': 'input_audio_buffer.commit'}
-            self.ws.send(json.dumps(commit_event))
-            print('[REALTIME] Committed audio buffer', flush=True)
+            # Check if transcription is already available (VAD completed flow)
+            # This handles the case where server VAD auto-commits and transcribes
+            # before the user manually stops recording
+            # Use lock to safely check state set by receiver thread
+            with self.lock:
+                if self.response_complete and self.current_response_text:
+                    result = self.current_response_text.strip()
+                    # Reset state for next recording
+                    self.current_response_text = ""
+                    self.response_complete = False
+                    self.response_event.clear()
+                    self.audio_buffer_seconds = 0.0
+                    self._buffer_committed = False
+                    print(f'[REALTIME] Using VAD-triggered transcription ({len(result)} chars)', flush=True)
+                    return result
+
+                # Reset response state for manual commit flow
+                self.current_response_text = ""
+                self.response_complete = False
+                self.response_event.clear()
+
+                # Capture buffer committed state and reset it
+                # This prevents "buffer too small" error when VAD auto-commits on speech end
+                buffer_was_committed = self._buffer_committed
+                self._buffer_committed = False
+
+            # Only send commit if buffer hasn't already been committed by VAD
+            # (do this outside lock to avoid holding lock during I/O)
+            if not buffer_was_committed:
+                commit_event = {'type': 'input_audio_buffer.commit'}
+                self.ws.send(json.dumps(commit_event))
+                print('[REALTIME] Committed audio buffer', flush=True)
+            else:
+                print('[REALTIME] Skipping commit (VAD already committed)', flush=True)
             
             # For converse mode, request a response from the model
             # For transcribe mode, transcription happens automatically via VAD

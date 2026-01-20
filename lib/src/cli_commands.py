@@ -5,6 +5,7 @@ CLI command implementations for hyprwhspr
 import os
 import sys
 import json
+import paths
 import subprocess
 import getpass
 import shutil
@@ -17,15 +18,27 @@ except (ImportError, ModuleNotFoundError) as e:
     # Hard fail – rich is required for the CLI
     print("ERROR: python-rich is not available in this Python environment.", file=sys.stderr)
     print(f"ImportError: {e}", file=sys.stderr)
-    print("\nTry installing it, for example:", file=sys.stderr)
-    print("  pacman -S python-rich    # system-wide on Arch", file=sys.stderr)
-    print("  pip install rich>=13.0.0  # or via pip", file=sys.stderr)
+    print("\nTry installing it using your package manager:", file=sys.stderr)
+    print("  Arch:          pacman -S python-rich", file=sys.stderr)
+    print("  Debian/Ubuntu: apt install python3-rich", file=sys.stderr)
+    print("  Fedora:        dnf install python3-rich", file=sys.stderr)
+    print("  Or via pip:    pip install rich>=13.0.0", file=sys.stderr)
     sys.exit(1)
 
 try:
     from .config_manager import ConfigManager
 except ImportError:
     from config_manager import ConfigManager
+
+try:
+    from .paths import CONFIG_DIR, CONFIG_FILE
+except ImportError:
+    from paths import CONFIG_DIR, CONFIG_FILE
+
+try:
+    from .backend_utils import BACKEND_DISPLAY_NAMES, normalize_backend
+except ImportError:
+    from backend_utils import BACKEND_DISPLAY_NAMES, normalize_backend
 
 try:
     from .backend_installer import (
@@ -77,12 +90,125 @@ except ImportError:
 # Constants
 HYPRWHSPR_ROOT = os.environ.get('HYPRWHSPR_ROOT', '/usr/lib/hyprwhspr')
 SERVICE_NAME = 'hyprwhspr.service'
+RESUME_SERVICE_NAME = 'hyprwhspr-resume.service'  # Deprecated, kept for cleanup in uninstall/status
 PARAKEET_SERVICE_NAME = 'parakeet-tdt-0.6b-v3.service'
 YDOTOOL_UNIT = 'ydotool.service'
 USER_HOME = Path.home()
-USER_CONFIG_DIR = USER_HOME / '.config' / 'hyprwhspr'
+USER_CONFIG_DIR = CONFIG_DIR  # Use centralized path constant
 USER_SYSTEMD_DIR = USER_HOME / '.config' / 'systemd' / 'user'
 PYWHISPERCPP_MODELS_DIR = Path(os.environ.get('XDG_DATA_HOME', USER_HOME / '.local' / 'share')) / 'pywhispercpp' / 'models'
+
+
+def _check_mise_active() -> tuple[bool, str]:
+    """
+    Check if MISE (runtime version manager) is active in the current environment.
+
+    Returns:
+        Tuple of (is_active, details_message)
+    """
+    indicators = []
+
+    # Check for MISE environment variables
+    if os.environ.get('MISE_SHELL'):
+        indicators.append(f"MISE_SHELL={os.environ['MISE_SHELL']}")
+    if os.environ.get('__MISE_ACTIVATE'):
+        indicators.append("__MISE_ACTIVATE is set")
+
+    # Check if Python is being managed by MISE
+    python_path = shutil.which('python3') or shutil.which('python')
+    if python_path and '.local/share/mise' in python_path:
+        indicators.append(f"Python path: {python_path}")
+
+    # Check if mise binary is managing this session
+    if shutil.which('mise') and os.environ.get('MISE_DATA_DIR'):
+        indicators.append(f"MISE_DATA_DIR={os.environ['MISE_DATA_DIR']}")
+
+    is_active = len(indicators) > 0
+    details = "\n    ".join(indicators) if indicators else ""
+
+    return is_active, details
+
+
+def _create_mise_free_environment() -> dict:
+    """
+    Create environment with MISE deactivated for subprocesses.
+
+    This prevents MISE from interfering with Python version detection
+    during pip install operations.
+
+    Returns:
+        Environment dict suitable for subprocess.run(env=...)
+    """
+    env = os.environ.copy()
+
+    # Remove MISE-related environment variables
+    mise_vars = ['MISE_SHELL', '__MISE_ACTIVATE', 'MISE_DATA_DIR']
+    for var in mise_vars:
+        env.pop(var, None)
+
+    # Clean PATH of MISE entries
+    path = env.get('PATH', '')
+    if '.local/share/mise' in path:
+        paths = path.split(':')
+        paths = [p for p in paths if '.local/share/mise' not in p]
+        env['PATH'] = ':'.join(paths)
+
+    return env
+
+
+def _check_ydotool_version() -> tuple[bool, str, str]:
+    """
+    Check if ydotool is installed and has a compatible version.
+
+    hyprwhspr requires ydotool 1.0+ for paste injection. Ubuntu/Debian apt
+    repositories contain an outdated 0.1.x version that uses incompatible syntax.
+
+    Returns:
+        Tuple of (is_compatible, version_string, message)
+        - is_compatible: True if ydotool 1.0+ is available
+        - version_string: The detected version or empty string
+        - message: Human-readable status message
+    """
+    MIN_VERSION = "1.0.0"
+
+    # Check if ydotool is installed
+    if not shutil.which('ydotool'):
+        return False, "", "ydotool not found"
+
+    # Get version
+    try:
+        result = subprocess.run(
+            ['ydotool', '--version'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        version_output = result.stdout + result.stderr
+    except Exception:
+        version_output = ""
+
+    # Parse version (ydotool 1.0+ outputs "ydotool version X.Y.Z")
+    import re
+    match = re.search(r'(\d+\.\d+\.?\d*)', version_output)
+    if match:
+        version = match.group(1)
+    else:
+        # Can't parse version - assume old version
+        version = "0.1.0"
+
+    # Compare versions
+    def version_tuple(v):
+        return tuple(map(int, (v.split('.') + ['0', '0'])[:3]))
+
+    try:
+        is_compatible = version_tuple(version) >= version_tuple(MIN_VERSION)
+    except ValueError:
+        is_compatible = False
+
+    if is_compatible:
+        return True, version, f"ydotool {version} (compatible)"
+    else:
+        return False, version, f"ydotool {version} is too old (requires {MIN_VERSION}+)"
 
 
 def _strip_jsonc(text: str) -> str:
@@ -202,9 +328,9 @@ def _validate_hyprwhspr_root() -> bool:
 def _detect_current_backend() -> Optional[str]:
     """
     Detect currently installed backend.
-    
+
     Returns:
-        'cpu', 'nvidia', 'amd', 'parakeet', 'rest-api', or None if not detected
+        'cpu', 'nvidia', 'amd', 'vulkan', 'parakeet', 'onnx-asr', 'rest-api', or None if not detected
     """
     # First check config file
     try:
@@ -232,16 +358,26 @@ def _detect_current_backend() -> Optional[str]:
             return 'cpu'  # Fallback
         
         if backend == 'rest-api':
-            # Check if it's parakeet by checking endpoint URL
-            endpoint = config_manager.get_setting('rest_endpoint_url', '')
-            if endpoint == 'http://127.0.0.1:8080/transcribe':
-                # Check if parakeet venv exists
-                if PARAKEET_VENV_DIR.exists():
-                    return 'parakeet'
             return 'rest-api'
         if backend == 'realtime-ws':
             return 'realtime-ws'
-        if backend in ['cpu', 'nvidia', 'amd', 'pywhispercpp']:
+        if backend == 'onnx-asr':
+            # Verify onnx-asr is actually installed in venv
+            venv_python = VENV_DIR / 'bin' / 'python'
+            if venv_python.exists():
+                try:
+                    result = subprocess.run(
+                        [str(venv_python), '-c', 'import onnx_asr; print("ok")'],
+                        check=False,
+                        capture_output=True,
+                        text=True
+                    )
+                    if result.returncode == 0:
+                        return 'onnx-asr'
+                except Exception:
+                    pass
+            # onnx-asr configured but not installed - fall through to return None
+        if backend in ['cpu', 'nvidia', 'amd', 'vulkan', 'pywhispercpp']:
             # Verify it's actually installed in venv
             venv_python = VENV_DIR / 'bin' / 'python'
             if venv_python.exists():
@@ -253,9 +389,8 @@ def _detect_current_backend() -> Optional[str]:
                         text=True
                     )
                     if result.returncode == 0:
-                        # Try to detect which variant by checking build artifacts or imports
-                        # For now, trust config - could enhance later
-                        return backend
+                        # Normalize backend before returning (handles 'amd' -> 'vulkan')
+                        return normalize_backend(backend)
                 except Exception:
                     pass
     except Exception:
@@ -283,10 +418,10 @@ def _detect_current_backend() -> Optional[str]:
 def _cleanup_backend(backend_type: str) -> bool:
     """
     Clean up an installed backend.
-    
+
     Args:
-        backend_type: 'cpu', 'nvidia', 'amd', 'parakeet', or 'remote'
-    
+        backend_type: 'cpu', 'nvidia', 'amd', 'vulkan', 'onnx-asr', or 'remote'
+
     Returns:
         True if cleanup succeeded
     """
@@ -320,18 +455,39 @@ def _cleanup_backend(backend_type: str) -> bool:
         
         log_success("Parakeet backend cleaned up")
         return True
-    
+
+    if backend_type == 'onnx-asr':
+        log_info("Cleaning up ONNX-ASR backend...")
+        venv_python = VENV_DIR / 'bin' / 'python'
+        if not venv_python.exists():
+            log_info("No venv found, nothing to clean")
+            return True
+        try:
+            pip_bin = VENV_DIR / 'bin' / 'pip'
+            if pip_bin.exists():
+                # Uninstall onnx-asr
+                subprocess.run(
+                    [str(pip_bin), 'uninstall', '-y', 'onnx-asr'],
+                    check=False,
+                    capture_output=True
+                )
+                log_success("ONNX-ASR backend cleaned up")
+            return True
+        except Exception as e:
+            log_warning(f"Cleanup warning: {e}")
+            return True  # Don't fail on cleanup errors
+
     if backend_type in ['rest-api', 'remote']:
         # REST API doesn't have venv, nothing to clean
         return True
-    
+
     log_info(f"Cleaning up {backend_type.upper()} backend...")
-    
+
     venv_python = VENV_DIR / 'bin' / 'python'
     if not venv_python.exists():
         log_info("No venv found, nothing to clean")
         return True
-    
+
     try:
         pip_bin = VENV_DIR / 'bin' / 'pip'
         if pip_bin.exists():
@@ -351,152 +507,104 @@ def _cleanup_backend(backend_type: str) -> bool:
 def _prompt_backend_selection():
     """Prompt user for backend selection with current state detection"""
     current_backend = _detect_current_backend()
-    
+
     print("\n" + "="*60)
     print("Backend Selection")
     print("="*60)
-    
+
     if current_backend:
-        backend_names = {
-            'cpu': 'CPU',
-            'nvidia': 'NVIDIA (CUDA)',
-            'amd': 'AMD (ROCm)',
-            'parakeet': 'Parakeet',
-            'rest-api': 'REST API',
-            'realtime-ws': 'Realtime WebSocket',
-            'pywhispercpp': 'pywhispercpp'
-        }
+        backend_names = BACKEND_DISPLAY_NAMES
         print(f"\nCurrent backend: {backend_names.get(current_backend, current_backend)}")
     else:
         print("\nNo backend currently configured.")
-    
+
     print("\nChoose your transcription backend:")
     print()
-    print("PyWhisperCPP (Local in-memory default, very fast):")
-    print("  [1] CPU - CPU-only, works on all systems")
-    print("  [2] NVIDIA - NVIDIA GPU acceleration (CUDA)")
-    print("  [3] AMD - AMD GPU acceleration (ROCm)")
+    print("Local In-Memory Backends:")
+    print("  [1] Parakeet TDT V3   - Solid performance for most people (Autodetects CPU/GPU)")
+    print("  [2] Whisper (CPU)     - whisper.cpp, works everywhere")
+    print("  [3] Whisper (NVIDIA)  - whisper.cpp + CUDA, perfect for NVIDIA GPUs")
+    print("  [4] Whisper (Vulkan)  - whisper.cpp + Vulkan, AMD/Intel GPUs")
     print()
-    print("REST API (Remote - Cloud API or localhost):")
-    print("  [4] Configure cloud provider or custom backend")
+    print("Cloud/REST Backends:")
+    print("  [5] REST API          - OpenAI, Groq, or custom endpoint")
+    print("  [6] Realtime WS       - Low-latency streaming (experimental)")
     print()
-    print("Realtime WebSocket (Low-latency cloud streaming transcription):")
-    print("  [5] Realtime WebSocket (OpenAI)")
-    print()
-    print("Parakeet (Local REST Server - Latest NVIDIA Parakeet model):")
-    print("  [6] NVIDIA Parakeet model")
-    print()
-    
+
     while True:
         try:
             choice = Prompt.ask("Select backend", choices=['1', '2', '3', '4', '5', '6'], default='1')
             backend_map = {
-                '1': 'cpu',
-                '2': 'nvidia',
-                '3': 'amd',
-                '4': 'rest-api',
-                '5': 'realtime-ws',
-                '6': 'parakeet'
+                '1': 'onnx-asr',
+                '2': 'cpu',
+                '3': 'nvidia',
+                '4': 'vulkan',
+                '5': 'rest-api',
+                '6': 'realtime-ws'
             }
             selected = backend_map[choice]
-            
+
+            # Backend display names for warnings/messages
+            backend_names = {
+                'onnx-asr': 'Parakeet TDT V3 (onnx-asr)',
+                'cpu': 'Whisper CPU',
+                'nvidia': 'Whisper NVIDIA (CUDA)',
+                'amd': 'Whisper AMD/Intel (Vulkan)',
+                'vulkan': 'Whisper AMD/Intel (Vulkan)',
+                'rest-api': 'REST API',
+                'realtime-ws': 'Realtime WebSocket',
+                'pywhispercpp': 'pywhispercpp'
+            }
+
             # Warn if switching to different backend
             if current_backend and current_backend != selected:
-                backend_names = {
-                    'cpu': 'CPU',
-                    'nvidia': 'NVIDIA (CUDA)',
-                    'amd': 'AMD (ROCm)',
-                    'parakeet': 'Parakeet',
-                    'rest-api': 'REST API',
-                    'realtime-ws': 'Realtime WebSocket',
-                    'pywhispercpp': 'pywhispercpp'
-                }
                 print(f"\n⚠️  Switching from {backend_names.get(current_backend, current_backend)} to {backend_names.get(selected, selected)}")
-                
-                if selected == 'parakeet':
-                    print("Parakeet uses a separate venv and runs as a local REST server.")
-                    if current_backend not in ['rest-api', 'remote', 'realtime-ws', 'parakeet']:
-                        print("This will uninstall the current backend.")
-                        if not Confirm.ask("Continue?", default=True):
-                            continue
-                elif current_backend not in ['rest-api', 'remote', 'realtime-ws', 'parakeet'] and selected not in ['rest-api', 'remote', 'realtime-ws', 'parakeet']:
+
+                if current_backend not in ['rest-api', 'remote', 'realtime-ws'] and selected not in ['rest-api', 'remote', 'realtime-ws']:
                     print("This will uninstall the current backend and install the new one.")
                     if not Confirm.ask("Continue?", default=True):
                         continue
                 elif selected in ['rest-api', 'realtime-ws']:
                     backend_type_name = 'REST API' if selected == 'rest-api' else 'Realtime WebSocket'
                     print(f"Switching to {backend_type_name} backend.")
-                    if current_backend == 'parakeet':
-                        print("The Parakeet venv will no longer be needed.")
-                        cleanup_venv = Confirm.ask("Remove the Parakeet venv to free up space?", default=False)
-                    else:
-                        print("The local backend venv will no longer be needed.")
-                        cleanup_venv = Confirm.ask("Remove the venv to free up space?", default=False)
-                    backend_names = {
-                        'cpu': 'CPU',
-                        'nvidia': 'NVIDIA (CUDA)',
-                        'amd': 'AMD (ROCm)',
-                        'parakeet': 'Parakeet',
-                        'rest-api': 'REST API',
-                        'realtime-ws': 'Realtime WebSocket'
-                    }
-                    print(f"\n✓ Selected: {backend_names[selected]}")
+                    print("The local backend venv will no longer be needed.")
+                    cleanup_venv = Confirm.ask("Remove the venv to free up space?", default=False)
+                    print(f"\n✓ Selected: {BACKEND_DISPLAY_NAMES.get(selected, selected)}")
                     return (selected, cleanup_venv, False)  # Return tuple: (backend, cleanup_venv, wants_reinstall)
-            
+
             # If re-selecting same backend, offer reinstall option
-            if current_backend == selected and selected not in ['rest-api', 'remote', 'realtime-ws', 'parakeet']:
-                backend_names = {
-                    'cpu': 'CPU',
-                    'nvidia': 'NVIDIA (CUDA)',
-                    'amd': 'AMD (ROCm)'
-                }
-                print(f"\n{backend_names.get(selected)} backend is already installed.")
+            # Local backends that need installation: cpu, nvidia, vulkan, onnx-asr
+            local_install_backends = ['cpu', 'nvidia', 'vulkan', 'onnx-asr']
+            if current_backend == selected and selected in local_install_backends:
+                print(f"\n{BACKEND_DISPLAY_NAMES.get(selected, selected)} backend is already installed.")
                 reinstall = Confirm.ask("Reinstall backend?", default=False)
                 if not reinstall:
                     print("Keeping existing installation.")
                     return (selected, False, False)  # Return tuple: (backend, cleanup_venv, wants_reinstall)
                 # If yes to reinstall, continue to return with wants_reinstall=True
             elif current_backend == selected and selected == 'parakeet':
-                backend_names = {
-                    'parakeet': 'Parakeet'
-                }
-                print(f"\n{backend_names.get(selected)} backend is already installed.")
+                print(f"\n{BACKEND_DISPLAY_NAMES.get(selected, selected)} backend is already installed.")
                 reinstall = Confirm.ask("Reinstall backend?", default=False)
                 if not reinstall:
                     print("Keeping existing installation.")
                     return (selected, False, False)  # Return tuple: (backend, cleanup_venv, wants_reinstall)
                 # If yes to reinstall, continue to return with wants_reinstall=True
             elif current_backend == selected and selected == 'realtime-ws':
-                backend_names = {
-                    'realtime-ws': 'Realtime WebSocket'
-                }
-                print(f"\n{backend_names.get(selected)} backend is already configured.")
+                print(f"\n{BACKEND_DISPLAY_NAMES.get(selected, selected)} backend is already configured.")
                 reconfigure = Confirm.ask("Reconfigure backend?", default=False)
                 if not reconfigure:
                     print("Keeping existing configuration.")
                     return (selected, False, False)  # Return tuple: (backend, cleanup_venv, wants_reinstall)
                 # If yes to reconfigure, continue to return with wants_reinstall=True for correct state tracking
             elif current_backend == selected and selected in ['rest-api', 'remote']:
-                backend_names = {
-                    'rest-api': 'REST API',
-                    'remote': 'REST API'
-                }
-                print(f"\n{backend_names.get(selected)} backend is already configured.")
+                print(f"\n{BACKEND_DISPLAY_NAMES.get(selected, selected)} backend is already configured.")
                 reconfigure = Confirm.ask("Reconfigure backend?", default=False)
                 if not reconfigure:
                     print("Keeping existing configuration.")
                     return (selected, False, False)  # Return tuple: (backend, cleanup_venv, wants_reinstall)
                 # If yes to reconfigure, continue to return with wants_reinstall=True for correct state tracking
-            
-            backend_names = {
-                'cpu': 'CPU',
-                'nvidia': 'NVIDIA (CUDA)',
-                'amd': 'AMD (ROCm)',
-                'parakeet': 'Parakeet',
-                'rest-api': 'REST API',
-                'realtime-ws': 'Realtime WebSocket'
-            }
-            print(f"\n✓ Selected: {backend_names[selected]}")
+
+            print(f"\n✓ Selected: {backend_names.get(selected, selected)}")
             # Check if user wants to reinstall/reconfigure (same backend selected and they said yes)
             # For local backends: wants_reinstall means reinstall
             # For cloud backends: wants_reinstall means reconfigure (correctly tracks user intent)
@@ -691,20 +799,25 @@ def _prompt_remote_provider_selection(filter_realtime: bool = False):
                 print("="*60)
                 print("\nConfigure a custom REST API backend.")
                 print()
-                
+
                 endpoint_url = Prompt.ask("Endpoint URL", default="")
                 if not endpoint_url:
                     log_error("Endpoint URL is required")
                     if not Confirm.ask("Try again?", default=True):
                         return None
                     continue
-                
+
                 # Validate URL format
                 if not endpoint_url.startswith('http://') and not endpoint_url.startswith('https://'):
                     log_warning("URL should start with http:// or https://")
                     if not Confirm.ask("Continue anyway?", default=True):
                         continue
-                
+
+                # Model name - required for REST APIs, optional for WebSocket
+                print("\nModel name (required for REST APIs, leave blank for WebSocket)")
+                print("Examples: whisper-1, whisper-large-v3, distil-whisper-large-v3-en")
+                model_name = Prompt.ask("Model name", default="") or None
+
                 # Optional API key
                 has_api_key = Confirm.ask("Do you have an API key?", default=False)
                 api_key = None
@@ -714,7 +827,7 @@ def _prompt_remote_provider_selection(filter_realtime: bool = False):
                     # Save as 'custom' provider
                     if api_key:
                         save_credential('custom', api_key)
-                
+
                 # Optional custom headers
                 has_headers = Confirm.ask("Add custom HTTP headers?", default=False)
                 custom_headers = {}
@@ -728,28 +841,28 @@ def _prompt_remote_provider_selection(filter_realtime: bool = False):
                     except json.JSONDecodeError as e:
                         log_error(f"Invalid JSON: {e}")
                         custom_headers = {}
-                
-                # Optional custom body fields
-                has_body = Confirm.ask("Add custom body fields?", default=False)
-                custom_body = {}
+
+                # Optional additional body fields
+                has_body = Confirm.ask("Add additional body fields?", default=False)
+                custom_body = {'model': model_name} if model_name else {}
                 if has_body:
-                    body_json = Prompt.ask("Enter body fields as JSON (e.g., {\"model\": \"custom-model\"})", default="{}")
+                    body_json = Prompt.ask("Enter additional body fields as JSON (e.g., {\"language\": \"en\"})", default="{}")
                     try:
-                        custom_body = json.loads(body_json)
-                        if not isinstance(custom_body, dict):
+                        extra_body = json.loads(body_json)
+                        if isinstance(extra_body, dict):
+                            custom_body.update(extra_body)
+                        else:
                             log_error("Body fields must be a JSON object")
-                            custom_body = {}
                     except json.JSONDecodeError as e:
                         log_error(f"Invalid JSON: {e}")
-                        custom_body = {}
-                
+
                 custom_config = {
                     'endpoint': endpoint_url,
                     'headers': custom_headers,
                     'body': custom_body
                 }
-                
-                return ('custom', None, api_key, custom_config)
+
+                return ('custom', model_name, api_key, custom_config)
                 
         except KeyboardInterrupt:
             print("\n\nCancelled by user.")
@@ -814,6 +927,59 @@ def _generate_remote_config(provider_id: str, model_id: Optional[str], api_key: 
     return config
 
 
+def _setup_command_symlink():
+    """Offer to create ~/.local/bin/hyprwhspr symlink for git clone installs"""
+    # Only relevant for non-package installs (git clones)
+    if HYPRWHSPR_ROOT == '/usr/lib/hyprwhspr':
+        return  # Package install, symlink not needed
+
+    local_bin = USER_HOME / '.local' / 'bin'
+    symlink_path = local_bin / 'hyprwhspr'
+    source_path = Path(HYPRWHSPR_ROOT) / 'bin' / 'hyprwhspr'
+
+    # Check if symlink already exists and points to correct location
+    if symlink_path.is_symlink():
+        try:
+            if symlink_path.resolve() == source_path.resolve():
+                log_info(f"Command symlink already configured: {symlink_path}")
+                return
+        except Exception:
+            pass
+
+    # Check if there's already a hyprwhspr in PATH that's not our symlink
+    existing = shutil.which('hyprwhspr')
+    if existing and Path(existing).resolve() != source_path.resolve():
+        log_info(f"hyprwhspr already in PATH: {existing}")
+        return
+
+    print("\n" + "="*60)
+    print("Command Setup")
+    print("="*60)
+    print(f"\nInstallation detected at: {HYPRWHSPR_ROOT}")
+    print(f"Create symlink so 'hyprwhspr' command works from anywhere?")
+    print(f"  {symlink_path} -> {source_path}")
+
+    if Confirm.ask("Create command symlink?", default=True):
+        try:
+            local_bin.mkdir(parents=True, exist_ok=True)
+            # Remove existing symlink if it points elsewhere
+            if symlink_path.exists() or symlink_path.is_symlink():
+                symlink_path.unlink()
+            symlink_path.symlink_to(source_path)
+            log_success(f"Created symlink: {symlink_path}")
+
+            # Check if ~/.local/bin is in PATH
+            path_dirs = os.environ.get('PATH', '').split(':')
+            if str(local_bin) not in path_dirs:
+                log_warning(f"{local_bin} is not in your PATH")
+                log_info("Add this to ~/.bashrc or ~/.zshrc:")
+                log_info(f'  export PATH="$HOME/.local/bin:$PATH"')
+        except Exception as e:
+            log_warning(f"Failed to create symlink: {e}")
+            log_info(f"You can create it manually:")
+            log_info(f"  ln -sf {source_path} {symlink_path}")
+
+
 def setup_command():
     """Interactive full initial setup"""
     print("\n" + "="*60)
@@ -821,7 +987,21 @@ def setup_command():
     print("="*60)
     print("\nThis setup will guide you through configuring hyprwhspr.")
     print("Skip any step by answering 'no'.\n")
-    
+
+    # Check for MISE interference and handle automatically
+    mise_active, _ = _check_mise_active()
+    if mise_active:
+        # Try to deactivate MISE (may be a shell function)
+        if shutil.which('mise'):
+            try:
+                run_command(['bash', '-c', 'mise deactivate'], check=False, capture_output=True)
+            except Exception:
+                pass
+        log_info("MISE deactivated for installation")
+
+    # Setup command symlink for git clone installs
+    _setup_command_symlink()
+
     # Step 1: Backend selection (now returns tuple: (backend, cleanup_venv))
     backend_result = _prompt_backend_selection()
     if not backend_result:
@@ -846,84 +1026,87 @@ def setup_command():
     
     current_backend = _detect_current_backend()
     
+    # Normalize backends for comparison (handles 'amd' -> 'vulkan' mapping)
+    if current_backend:
+        current_backend = normalize_backend(current_backend)
+    backend_normalized = normalize_backend(backend)
+    
+    # Check for Parakeet REST backend migration
+    # Detect parakeet by checking endpoint URL and venv existence
+    # (since _detect_current_backend() no longer returns 'parakeet')
+    is_parakeet_config = False
+    if current_backend == 'rest-api':
+        config_manager = ConfigManager()
+        endpoint = config_manager.get_setting('rest_endpoint_url', '')
+        if endpoint == 'http://127.0.0.1:8080/transcribe' and PARAKEET_VENV_DIR.exists():
+            is_parakeet_config = True
+    
+    if is_parakeet_config:
+        log_info("Parakeet REST backend detected.")
+        if Confirm.ask("\nMigrate to in-process onnx-asr backend (GPU-accelerated, no REST server)?", default=True):
+            backend_normalized = 'onnx-asr'
+            backend = 'onnx-asr'
+            log_info("Migrating to onnx-asr backend...")
+            # Clean up Parakeet REST service
+            if _cleanup_backend('parakeet'):
+                log_success("Parakeet REST backend cleaned up")
+            log_info("Will install onnx-asr backend instead")
+        else:
+            log_warning("Keeping Parakeet REST backend. Note: Parakeet REST is deprecated.")
+            log_warning("Consider migrating to onnx-asr for better performance and simpler setup.")
+            # Preserve Parakeet backend to prevent cleanup
+            backend_normalized = 'parakeet'
+            backend = 'parakeet'
+    
     # Handle backend switching
-    if current_backend and current_backend != backend:
+    if current_backend and current_backend != backend_normalized:
         if current_backend not in ['rest-api', 'remote', 'realtime-ws']:
             # Switching from local to something else
             if not _cleanup_backend(current_backend):
                 log_warning("Failed to clean up old backend, continuing anyway...")
         
-        # Also handle cleanup when switching TO Parakeet FROM local
-        if backend == 'parakeet' and current_backend in ['cpu', 'nvidia', 'amd']:
-            if VENV_DIR.exists():
-                cleanup_main_venv = Confirm.ask(
-                    "Remove the old local backend venv to free up space?", 
-                    default=False
-                )
-                if cleanup_main_venv:
-                    import shutil
-                    log_info("Removing main venv...")
-                    shutil.rmtree(VENV_DIR)
-                    log_success("Main venv removed")
         
-        if cleanup_venv and backend in ['rest-api', 'remote', 'realtime-ws']:
+        if cleanup_venv and backend_normalized in ['rest-api', 'remote', 'realtime-ws']:
             # User wants to remove venv when switching to cloud backend
             if VENV_DIR.exists():
                 log_info("Removing venv as requested...")
-                import shutil
                 shutil.rmtree(VENV_DIR)
                 log_success("Venv removed")
     
     # Step 1.5: Backend installation (if not cloud backend)
-    parakeet_installed = False
-    if backend not in ['rest-api', 'remote', 'realtime-ws']:
+    if backend_normalized not in ['rest-api', 'remote', 'realtime-ws']:
         # Skip installation section if user selected the same backend and declined reinstalling
-        if current_backend == backend and not wants_reinstall:
+        if current_backend == backend_normalized and not wants_reinstall:
             # User already said "no" to reinstalling in the selection step, skip installation section
-            # If Parakeet is already installed, mark it as installed so REST API auto-configuration works
-            if backend == 'parakeet' and current_backend == 'parakeet':
-                parakeet_installed = True
+            pass
         else:
             # New backend selected, or user wants to reinstall existing backend
             print("\n" + "="*60)
             print("Backend Installation")
             print("="*60)
-            if backend == 'parakeet':
-                print("\nThis will install the Parakeet backend.")
-                print("This will create a separate virtual environment and install dependencies.")
-                print("Parakeet runs as a local REST API server that hyprwhspr connects to.")
+            if backend_normalized == 'onnx-asr':
+                print("\nThis will install the ONNX-ASR backend for hyprwhspr.")
+                print("This backend automatically detects and uses GPU acceleration when available,")
+                print("or falls back to CPU-optimized mode. Uses ONNX runtime for fast transcription.")
+                print("This may take several minutes as it downloads models and dependencies.")
             else:
-                print(f"\nThis will install the {backend.upper()} backend for pywhispercpp.")
+                print(f"\nThis will install the {backend_normalized.upper()} backend for pywhispercpp.")
                 print("This may take several minutes as it compiles from source.")
             if not Confirm.ask("Proceed with backend installation?", default=True):
                 log_warning("Skipping backend installation. You can install it later.")
                 log_warning("Backend installation is required for local transcription to work.")
             else:
-                if not install_backend(backend):
+                # Pass force_rebuild=True when reinstalling to ensure clean venv
+                # Use normalized backend to ensure 'amd' -> 'vulkan' for new installs
+                if not install_backend(backend_normalized, force_rebuild=wants_reinstall):
                     log_error("Backend installation failed. Setup cannot continue.")
                     return
                 
-                if backend == 'parakeet':
-                    parakeet_installed = True
     
-    # Step 2: Provider/model selection (if REST API backend or parakeet)
+    # Step 2: Provider/model selection (if REST API backend)
     remote_config = None
     selected_model = None
-    if backend == 'parakeet':
-        # Auto-configure REST API for parakeet (always needed, regardless of installation status)
-        # If installation was skipped, user can install Parakeet later, but config should be set up now
-        log_info("Auto-configuring REST API for Parakeet...")
-        remote_config = {
-            'transcription_backend': 'rest-api',
-            'rest_endpoint_url': 'http://127.0.0.1:8080/transcribe',
-            'rest_headers': {},
-            'rest_body': {}
-        }
-        log_success("Parakeet REST API configuration ready")
-        if not parakeet_installed:
-            log_warning("Parakeet backend is not installed. Install it later to use this configuration.")
-        # Note about manual start will be shown later if systemd is not set up
-    elif backend in ['rest-api', 'remote']:
+    if backend_normalized in ['rest-api', 'remote']:
         # Prompt for remote provider selection
         provider_result = _prompt_remote_provider_selection()
         if not provider_result:
@@ -939,7 +1122,7 @@ def setup_command():
         except Exception as e:
             log_error(f"Failed to generate remote configuration: {e}")
             return
-    elif backend == 'realtime-ws':
+    elif backend_normalized == 'realtime-ws':
         # Prompt for remote provider selection (filter for realtime models)
         provider_result = _prompt_remote_provider_selection(filter_realtime=True)
         if not provider_result:
@@ -1021,7 +1204,7 @@ def setup_command():
         log_info(f"Realtime mode: {realtime_mode}")
     
     # Step 1.4: Ensure venv and base dependencies for cloud backends
-    if backend in ['rest-api', 'remote', 'realtime-ws']:
+    if backend_normalized in ['rest-api', 'remote', 'realtime-ws']:
         print("\n" + "="*60)
         print("Python Environment Setup")
         print("="*60)
@@ -1056,7 +1239,15 @@ def setup_command():
         
         # Install base dependencies if needed (excluding pywhispercpp)
         if cur_req_hash != stored_req_hash or not stored_req_hash or not deps_installed:
-            log_info("Installing base Python dependencies (excluding pywhispercpp)...")
+            if not stored_req_hash:
+                # First time setup - no stored hash means venv is new
+                log_info("Installing base Python dependencies (excluding pywhispercpp)...")
+            elif cur_req_hash != stored_req_hash:
+                # Requirements actually changed
+                log_info("Requirements.txt has changed. Updating base Python dependencies...")
+            else:
+                # Dependencies missing but hash matches (shouldn't happen often)
+                log_info("Installing missing base Python dependencies...")
             
             import tempfile
             with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as temp_req:
@@ -1087,9 +1278,10 @@ def setup_command():
         else:
             log_info("Base Python dependencies up to date")
     
-    elif backend not in ['rest-api', 'remote', 'realtime-ws', 'parakeet']:
+    # Step 2: Model selection for local backends (always prompt, regardless of install/reinstall)
+    if backend_normalized not in ['rest-api', 'remote', 'realtime-ws', 'parakeet', 'onnx-asr']:
         # Local backend - prompt for model selection
-        # Note: Parakeet doesn't use Whisper models, it's handled via REST API auto-configuration
+        # Note: ONNX-ASR doesn't use Whisper models, it has its own models
         selected_model = _prompt_model_selection()
     
     # Step 3: Waybar integration
@@ -1107,22 +1299,92 @@ def setup_command():
         print("\nWaybar configuration not found.")
         setup_waybar_choice = Confirm.ask("Set up Waybar integration anyway?", default=False)
     
+    # Step 3b: Mic-OSD setup
+    print("\n" + "="*60)
+    print("Mic-OSD Visualization")
+    print("="*60)
+    print("\nShows a visual overlay during recording with animated bars")
+    print("and a pulsing indicator. Requires GTK4 and gtk4-layer-shell.")
+    
+    # Check if dependencies are available using service's Python
+    mic_osd_available, mic_osd_reason = _check_mic_osd_availability()
+    if not mic_osd_available:
+        print(f"\nNote: {mic_osd_reason}")
+    
+    if mic_osd_available:
+        setup_mic_osd_choice = Confirm.ask("Enable mic-osd visualization?", default=True)
+    else:
+        # Provide distro-appropriate package names
+        if Path('/etc/debian_version').exists():
+            pkg_hint = "python3-gi gir1.2-gtk-4.0 gir1.2-gtk4layershell-1.0"
+        elif Path('/etc/fedora-release').exists():
+            pkg_hint = "python3-gobject gtk4 gtk4-layer-shell"
+        elif Path('/etc/os-release').exists() and 'suse' in Path('/etc/os-release').read_text().lower():
+            pkg_hint = "python3-gobject typelib-1_0-Gtk-4_0 (gtk4-layer-shell from community repo)"
+        else:
+            pkg_hint = "python-gobject gtk4 gtk4-layer-shell (Arch naming)"
+        print(f"\nDependencies not found. Install: {pkg_hint}")
+        setup_mic_osd_choice = Confirm.ask("Enable mic-osd anyway (will work after installing deps)?", default=False)
+
+    # Step 3c: Audio ducking setup
+    print("\n" + "="*60)
+    print("Audio Ducking")
+    print("="*60)
+    print("\nAutomatically reduces system volume while recording to prevent")
+    print("audio interference with your microphone.")
+
+    setup_audio_ducking_choice = Confirm.ask("Enable audio ducking?", default=True)
+    audio_ducking_percent = 50  # Default
+    if setup_audio_ducking_choice:
+        print("\nHow much to reduce volume BY during recording?")
+        print("  50 = reduce to 50% of original (recommended)")
+        print("  70 = reduce to 30% of original (aggressive)")
+        print("  30 = reduce to 70% of original (subtle)")
+        ducking_input = Prompt.ask("Reduction percentage", default="50")
+        try:
+            audio_ducking_percent = max(0, min(100, int(ducking_input)))
+        except ValueError:
+            audio_ducking_percent = 50
+            log_warning("Invalid input, using default 50%")
+
+    # Step 3d: Hyprland compositor bindings
+    # Detect if user is running Hyprland
+    is_hyprland_session = os.environ.get('HYPRLAND_INSTANCE_SIGNATURE') is not None
+    current_desktop = os.environ.get('XDG_CURRENT_DESKTOP', '').lower()
+    hypr_config_dir = USER_HOME / '.config' / 'hypr'
+    hypr_config_exists = (hypr_config_dir / 'hyprland.conf').exists() or (hypr_config_dir / 'bindings.conf').exists()
+
+    # Only show Hyprland section if relevant
+    if is_hyprland_session or hypr_config_exists or 'hyprland' in current_desktop:
+        print("\n" + "="*60)
+        print("Hyprland Compositor Bindings")
+        print("="*60)
+        print("\nUse Hyprland's native compositor bindings instead of evdev keyboard grabbing.")
+        print("Better compatibility with keyboard remappers.")
+        print("Requires adding bindings to ~/.config/hypr/hyprland.conf or bindings.conf")
+
+        if is_hyprland_session:
+            print("\nHyprland session detected.")
+            setup_hyprland_choice = Confirm.ask("Configure Hyprland compositor bindings?", default=True)
+        elif hypr_config_exists:
+            print(f"\nHyprland configuration detected at: {hypr_config_dir}")
+            setup_hyprland_choice = Confirm.ask("Configure Hyprland compositor bindings?", default=True)
+        else:
+            print("\nHyprland configuration not found.")
+            setup_hyprland_choice = Confirm.ask("Set up Hyprland compositor bindings anyway?", default=False)
+    else:
+        # Not a Hyprland system - skip this section entirely
+        setup_hyprland_choice = False
+    
     # Step 4: Systemd setup
     print("\n" + "="*60)
     print("Systemd Service")
     print("="*60)
-    if backend == 'parakeet':
-        print("\nSystemd user services will run both hyprwhspr and the Parakeet server in the background.")
-        print("This will enable/configure:")
-        print("  • ydotool.service (required dependency, provides paste)")
-        print("  • parakeet-tdt-0.6b-v3.service (Parakeet REST API server)")
-        print("  • hyprwhspr.service (main application)")
-    else:
-        print("\nSystemd user service will run hyprwhspr in the background.")
-        print("This will enable/configure:")
-        print("  • ydotool.service (required dependency, provides paste)")
-        print("  • hyprwhspr.service (main application)")
-    setup_systemd_choice = Confirm.ask("Set up systemd user service" + ("s" if backend == 'parakeet' else ""), default=True)
+    print("\nSystemd user service will run hyprwhspr in the background.")
+    print("This will enable/configure:")
+    print("  • ydotool.service (required dependency, provides paste)")
+    print("  • hyprwhspr.service (main application)")
+    setup_systemd_choice = Confirm.ask("Set up systemd user service?", default=True)
     
     # Step 5: Permissions setup
     print("\n" + "="*60)
@@ -1138,10 +1400,7 @@ def setup_command():
     print("Setup Summary")
     print("="*60)
     print(f"\nBackend: {backend}")
-    if backend == 'parakeet' and remote_config:
-        print(f"Endpoint: {remote_config.get('rest_endpoint_url', 'N/A')}")
-        print("Model: parakeet-tdt-0.6b-v3")
-    elif remote_config:
+    if remote_config:
         print(f"Endpoint: {remote_config.get('rest_endpoint_url', 'N/A')}")
         if remote_config.get('rest_body'):
             model_name = remote_config['rest_body'].get('model', 'N/A')
@@ -1163,16 +1422,16 @@ def setup_command():
     elif selected_model:
         print(f"Model: {selected_model}")
     print(f"Waybar integration: {'Yes' if setup_waybar_choice else 'No'}")
-    if backend == 'parakeet':
-        if setup_systemd_choice:
-            print("Systemd services: Yes (ydotool + Parakeet + hyprwhspr)")
-        else:
-            print("Systemd services: No")
+    print(f"Mic-OSD visualization: {'Yes' if setup_mic_osd_choice else 'No'}")
+    if setup_audio_ducking_choice:
+        print(f"Audio ducking: Yes ({audio_ducking_percent}% reduction)")
     else:
-        if setup_systemd_choice:
-            print("Systemd services: Yes (ydotool + hyprwhspr)")
-        else:
-            print("Systemd service: No")
+        print("Audio ducking: No")
+    print(f"Hyprland compositor bindings: {'Yes' if setup_hyprland_choice else 'No'}")
+    if setup_systemd_choice:
+        print("Systemd services: Yes (ydotool + hyprwhspr)")
+    else:
+        print("Systemd service: No")
     print(f"Permissions: {'Yes' if setup_permissions_choice else 'No'}")
     print()
     
@@ -1189,9 +1448,9 @@ def setup_command():
     try:
         # Step 1: Config
         if remote_config:
-            setup_config(backend=backend, remote_config=remote_config)
+            setup_config(backend=backend_normalized, remote_config=remote_config)
         else:
-            setup_config(backend=backend, model=selected_model)
+            setup_config(backend=backend_normalized, model=selected_model)
         
         # Check if running manually before systemd setup
         if _is_running_manually():
@@ -1203,6 +1462,44 @@ def setup_command():
             setup_waybar('install')
         else:
             log_info("Skipping Waybar integration")
+        
+        # Step 2b: Mic-OSD
+        if setup_mic_osd_choice:
+            mic_osd_enable()
+        else:
+            mic_osd_disable()
+            log_info("Mic-OSD visualization disabled")
+
+        # Step 2c: Audio ducking
+        config = ConfigManager()
+        config.set_setting('audio_ducking', setup_audio_ducking_choice)
+        if setup_audio_ducking_choice:
+            config.set_setting('audio_ducking_percent', audio_ducking_percent)
+            log_success(f"Audio ducking enabled ({audio_ducking_percent}% reduction)")
+        else:
+            log_info("Audio ducking disabled")
+        config.save_config()
+
+        # Step 2d: Hyprland compositor bindings
+        if setup_hyprland_choice:
+            print("\n" + "="*60)
+            print("Hyprland Compositor Bindings")
+            print("="*60)
+            # Update config to use Hyprland bindings
+            config = ConfigManager()
+            config.set_setting('use_hypr_bindings', True)
+            config.set_setting('grab_keys', False)
+            config.save_config()
+            log_success("Configuration updated for Hyprland compositor bindings")
+            
+            # Add bindings to Hyprland config file
+            if _setup_hyprland_bindings():
+                log_success("Hyprland bindings added to config file")
+            else:
+                log_warning("Could not add Hyprland bindings automatically")
+                log_warning("See README for manual setup instructions")
+        else:
+            log_info("Skipping Hyprland compositor bindings setup")
         
         # Step 3: Systemd
         if setup_systemd_choice:
@@ -1277,9 +1574,6 @@ def setup_command():
                 print("  Parakeet server will start automatically via systemd")
             print("  Press hotkey to start dictation!")
         else:
-            if backend == 'parakeet':
-                print("  Start the Parakeet server manually:")
-                print(f"    {PARAKEET_VENV_DIR / 'bin' / 'python'} {PARAKEET_SCRIPT}")
             print("  Run hyprwhspr manually or set up systemd service later")
             print("  Press hotkey to start dictation!")
         print()
@@ -1295,6 +1589,423 @@ def setup_command():
         sys.exit(1)
 
 
+# ==================== Install Commands ====================
+
+def _auto_download_model(model: str = 'base'):
+    """Auto-download Whisper model without prompts
+
+    Args:
+        model: Model name to download (default: 'base')
+    """
+    try:
+        from .backend_installer import download_pywhispercpp_model
+    except ImportError:
+        from backend_installer import download_pywhispercpp_model
+
+    log_info(f"Downloading {model} Whisper model...")
+    if download_pywhispercpp_model(model):
+        log_success("Model downloaded")
+    else:
+        log_warning(f"Model download failed - can download later with: hyprwhspr model download {model}")
+
+
+def _setup_hyprland_bindings() -> bool:
+    """
+    Set up Hyprland compositor bindings in config file.
+    
+    Returns:
+        True if bindings were added successfully, False otherwise
+    """
+    hypr_config_dir = USER_HOME / '.config' / 'hypr'
+    bindings_file = hypr_config_dir / 'bindings.conf'
+    hyprland_conf = hypr_config_dir / 'hyprland.conf'
+    
+    # Determine which file to use
+    target_file = None
+    if bindings_file.exists():
+        target_file = bindings_file
+        log_info(f"Found bindings file: {bindings_file}")
+    elif hyprland_conf.exists():
+        target_file = hyprland_conf
+        log_info(f"Found hyprland.conf, using it instead: {hyprland_conf}")
+    else:
+        # Create bindings.conf if neither exists
+        target_file = bindings_file
+        try:
+            hypr_config_dir.mkdir(parents=True, exist_ok=True)
+            log_info(f"Creating bindings file: {bindings_file}")
+        except Exception as e:
+            log_warning(f"Could not create Hyprland config directory: {e}")
+            log_warning("Skipping Hyprland bindings setup - see README for manual setup")
+            return False
+    
+    if target_file:
+        # Check if bindings already exist
+        bindings_exist = False
+        try:
+            if target_file.exists():
+                with open(target_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    # Check for existing hyprwhspr bindings
+                    # Just check for the command - keybind could be anything
+                    if 'hyprwhspr-tray.sh record' in content or \
+                       '# added by hyprwhspr' in content:
+                        bindings_exist = True
+        except Exception as e:
+            log_warning(f"Could not read {target_file}: {e}")
+            log_warning("Skipping duplicate check - will attempt to add bindings")
+        
+        if bindings_exist:
+            log_info("Hyprland bindings already exist, skipping")
+            return True
+        else:
+            # Append bindings to file
+            try:
+                with open(target_file, 'a', encoding='utf-8') as f:
+                    f.write('\n# hyprwhspr - Toggle mode (added by hyprwhspr setup)\n')
+                    f.write('# Press once to start, press again to stop\n')
+                    f.write('bindd = SUPER ALT, D, Speech-to-text, exec, /usr/lib/hyprwhspr/config/hyprland/hyprwhspr-tray.sh record\n')
+                log_success(f"Added Hyprland bindings to {target_file}")
+                log_info("Restart Hyprland or reload config to apply bindings")
+                return True
+            except PermissionError:
+                log_warning(f"Permission denied writing to {target_file}")
+                log_warning("Could not add bindings automatically - see README for manual setup")
+                return False
+            except Exception as e:
+                log_warning(f"Could not write to {target_file}: {e}")
+                log_warning("Could not add bindings automatically - see README for manual setup")
+                return False
+    
+    return False
+
+
+def _verify_installation_step(step_name: str, verify_func) -> bool:
+    """
+    Generic helper to verify an installation step.
+    
+    Args:
+        step_name: Human-readable name of the step
+        verify_func: Function that returns True if verification passes, False otherwise
+        
+    Returns:
+        True if verification passes, False otherwise
+    """
+    try:
+        if verify_func():
+            log_success(f"✓ {step_name} verified")
+            return True
+        else:
+            log_error(f"✗ {step_name} verification failed")
+            return False
+    except Exception as e:
+        log_error(f"✗ {step_name} verification error: {e}")
+        return False
+
+
+def _verify_backend_installation(backend: str) -> bool:
+    """
+    Verify that backend is actually importable from venv.
+
+    Args:
+        backend: Backend name (e.g., 'nvidia', 'vulkan', 'cpu', 'onnx-asr')
+
+    Returns:
+        True if backend is importable, False otherwise
+    """
+    if backend not in ['cpu', 'nvidia', 'vulkan', 'onnx-asr']:
+        # For non-local backends, skip import check
+        return True
+
+    venv_python = VENV_DIR / 'bin' / 'python'
+    if not venv_python.exists():
+        return False
+
+    # Choose the module to import based on backend
+    if backend == 'onnx-asr':
+        import_module = 'onnx_asr'
+    else:
+        import_module = 'pywhispercpp'
+
+    try:
+        result = subprocess.run(
+            [str(venv_python), '-c', f'import {import_module}'],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _verify_config_created() -> bool:
+    """
+    Verify that config file exists and contains expected settings.
+    
+    Returns:
+        True if config is valid, False otherwise
+    """
+    config_file = CONFIG_FILE
+    if not config_file.exists():
+        return False
+    
+    try:
+        config = ConfigManager()
+        # Check that essential settings exist
+        backend = config.get_setting('transcription_backend')
+        recording_mode = config.get_setting('recording_mode')
+        return backend is not None and recording_mode is not None
+    except Exception:
+        return False
+
+
+def _verify_service_running() -> bool:
+    """
+    Verify that systemd service is actually running.
+    
+    Returns:
+        True if service is active, False otherwise
+    """
+    return _is_service_running_via_systemd()
+
+
+def _verify_model_downloaded(model_name: str = 'base') -> bool:
+    """
+    Verify that model file exists and is readable.
+    
+    Args:
+        model_name: Model name (default: 'base')
+        
+    Returns:
+        True if model file exists, False otherwise
+    """
+    model_file = PYWHISPERCPP_MODELS_DIR / f'ggml-{model_name}.bin'
+    return model_file.exists() and model_file.is_file()
+
+
+def omarchy_command(args=None):
+    """
+    Automated setup
+
+    This command:
+    1. Auto-detects GPU hardware (NVIDIA/AMD/Intel/CPU) or uses specified backend
+    2. Installs appropriate backend (CUDA for NVIDIA, Vulkan for others, CPU fallback)
+    3. Configures defaults (auto recording mode, Waybar integration)
+    4. Sets up and starts systemd service
+    5. Validates installation
+
+    All without user interaction.
+
+    Args:
+        args: Optional argparse namespace with:
+            - backend: 'nvidia', 'vulkan', 'cpu', or 'onnx-asr' (default: auto-detect)
+            - model: Model name to download (default: 'base' for whisper, auto for onnx-asr)
+            - no_waybar: Skip waybar integration
+            - no_mic_osd: Disable mic-osd visualization
+            - no_systemd: Skip systemd service setup
+            - hypr_bindings: Enable Hyprland compositor bindings
+
+    Note: Hyprland compositor bindings are NOT configured by default.
+    Use 'hyprwhspr setup' for interactive setup with Hyprland compositor options,
+    or use --hypr-bindings flag.
+    """
+    # Import functions we need
+    try:
+        from .backend_installer import detect_gpu_type, install_backend
+        from .config_manager import ConfigManager
+    except ImportError:
+        from backend_installer import detect_gpu_type, install_backend
+        from config_manager import ConfigManager
+
+    # Extract CLI options with defaults for backwards compatibility
+    explicit_backend = getattr(args, 'backend', None) if args else None
+    explicit_model = getattr(args, 'model', None) if args else None
+    skip_waybar = getattr(args, 'no_waybar', False) if args else False
+    skip_mic_osd = getattr(args, 'no_mic_osd', False) if args else False
+    skip_systemd = getattr(args, 'no_systemd', False) if args else False
+    enable_hypr_bindings = getattr(args, 'hypr_bindings', False) if args else False
+
+    # 1. Print banner
+    print("\n" + "="*60)
+    print("hyprwhspr - automated setup")
+    print("="*60)
+
+    # 2. Check and handle MISE
+    mise_active, mise_details = _check_mise_active()
+    mise_free_env = None
+    if mise_active:
+        log_warning("MISE detected - will be temporarily deactivated for installation")
+        log_warning(f"Details:\n    {mise_details}")
+        mise_free_env = _create_mise_free_environment()
+        # Note: install_backend() already handles MISE warnings
+
+    # 3. Determine backend (explicit or auto-detect)
+    if explicit_backend:
+        backend = explicit_backend
+        log_info(f"Using specified backend: {backend.upper()}")
+    else:
+        log_info("Detecting hardware...")
+        gpu_type = detect_gpu_type()  # Returns 'nvidia', 'vulkan', or 'cpu'
+        backend = gpu_type
+
+        gpu_descriptions = {
+            'nvidia': 'NVIDIA GPU with CUDA acceleration',
+            'vulkan': 'GPU with Vulkan acceleration (AMD/Intel/other)',
+            'cpu': 'CPU-only (no GPU detected)'
+        }
+
+        log_success(f"Detected: {gpu_descriptions[gpu_type]}")
+
+    log_info(f"Installing: {backend.upper()} backend")
+
+    # 4. Install backend
+    print("\n" + "="*60)
+    print("Backend Installation")
+    print("="*60)
+
+    if not install_backend(backend, force_rebuild=False):
+        log_error("Backend installation failed")
+        return False
+    
+    # 4.5. Verify backend installation
+    print("\n" + "="*60)
+    print("Verifying Backend Installation")
+    print("="*60)
+    if not _verify_installation_step("Backend installation", lambda: _verify_backend_installation(backend)):
+        log_error("Backend installation verification failed - installation may be incomplete")
+        return False
+
+    # 5. Configure defaults
+    log_info("Configuring defaults...")
+    config = ConfigManager()
+    config.set_setting('recording_mode', 'auto')
+
+    # Configure backend-specific settings
+    if backend == 'onnx-asr':
+        config.set_setting('transcription_backend', 'onnx-asr')
+        # Set onnx-asr model (defaults to parakeet)
+        onnx_model = explicit_model or 'nemo-parakeet-tdt-0.6b-v3'
+        config.set_setting('onnx_asr_model', onnx_model)
+        log_info(f"Configured onnx-asr with model: {onnx_model}")
+    else:
+        config.set_setting('transcription_backend', 'pywhispercpp')
+        # Set whisper model (defaults to 'base')
+        whisper_model = explicit_model or 'base'
+        config.set_setting('model', whisper_model)
+        log_info(f"Configured pywhispercpp with model: {whisper_model}")
+
+    # Configure mic-osd (enabled unless --no-mic-osd specified)
+    config.set_setting('mic_osd_enabled', not skip_mic_osd)
+
+    # Configure Hyprland bindings if requested
+    if enable_hypr_bindings:
+        config.set_setting('use_hypr_bindings', True)
+        config.set_setting('grab_keys', False)
+        log_info("Hyprland compositor bindings enabled")
+
+    config.save_config()
+    log_success("Configuration saved")
+    
+    # 5.5. Verify config creation
+    if not _verify_installation_step("Config creation", _verify_config_created):
+        log_error("Config verification failed - configuration may be incomplete")
+        return False
+
+    # 6. Download model (for local whisper backends only)
+    # onnx-asr models download automatically on first use
+    if backend in ['cpu', 'nvidia', 'vulkan']:
+        model_to_download = explicit_model or 'base'
+        _auto_download_model(model_to_download)
+        # 6.5. Verify model download
+        if not _verify_installation_step("Model download", lambda: _verify_model_downloaded(model_to_download)):
+            log_warning("Model download verification failed - model may not be available")
+            log_warning(f"You can download it later with: hyprwhspr model download {model_to_download}")
+    elif backend == 'onnx-asr':
+        log_info("onnx-asr model will be downloaded automatically on first use")
+
+    # 7. Waybar integration (if detected and not skipped)
+    print("\n" + "="*60)
+    print("Waybar Integration")
+    print("="*60)
+
+    if skip_waybar:
+        log_info("Waybar integration skipped (--no-waybar)")
+    else:
+        waybar_config = Path.home() / '.config' / 'waybar' / 'config.jsonc'
+        if waybar_config.exists():
+            log_info("Waybar detected - installing integration...")
+            waybar_command('install')
+        else:
+            log_info("Waybar not detected - skipping")
+
+    # 8. Systemd service (unless skipped)
+    print("\n" + "="*60)
+    print("Systemd Service")
+    print("="*60)
+
+    if skip_systemd:
+        log_info("Systemd service setup skipped (--no-systemd)")
+    else:
+        systemd_command('install')
+
+        try:
+            from .output_control import run_command
+        except ImportError:
+            from output_control import run_command
+
+        try:
+            # Use MISE-free environment if MISE was detected
+            env = mise_free_env if mise_free_env else None
+            run_command(['systemctl', '--user', 'enable', 'hyprwhspr.service'], check=True, env=env)
+            run_command(['systemctl', '--user', 'start', 'hyprwhspr.service'], check=True, env=env)
+            log_success("Service enabled and started")
+        except Exception as e:
+            log_warning(f"Could not start service: {e}")
+
+        # 8.5. Verify service is running
+        print("\n" + "="*60)
+        print("Verifying Service Status")
+        print("="*60)
+        if not _verify_installation_step("Service running", _verify_service_running):
+            log_warning("Service verification failed - service may not be running")
+            log_warning("Check service status with: systemctl --user status hyprwhspr")
+
+    # 9. Validate
+    print("\n" + "="*60)
+    print("Validation")
+    print("="*60)
+    validate_command()
+
+    # 10. Restart service for clean initialization (only if systemd was set up)
+    if not skip_systemd:
+        print("\n" + "="*60)
+        print("Service Restart")
+        print("="*60)
+        log_info("Restarting service to ensure clean initialization...")
+
+        # Check if service is actually running before restarting
+        if _is_service_running_via_systemd():
+            systemd_restart()
+            log_success("Service restarted with clean state")
+        else:
+            log_warning("Service not running - skipping restart")
+
+    # 11. Completion
+    print("\n" + "="*60)
+    print("Setup Complete!")
+    print("="*60)
+    print("\nAutomated setup completed successfully!")
+    print("\nNext steps:")
+    print("  1. Log out and back in (for group permissions)")
+    print("  2. Press Super+Alt+D to start dictating")
+    print("  3. Tap (<400ms) to toggle, hold (>=400ms) for push-to-talk")
+    print("\nFor help: hyprwhspr --help")
+
+    return True
+
+
 # ==================== Config Commands ====================
 
 def config_command(action: str):
@@ -1305,6 +2016,8 @@ def config_command(action: str):
         show_config()
     elif action == 'edit':
         edit_config()
+    elif action == 'secondary-shortcut':
+        configure_secondary_shortcut()
     else:
         log_error(f"Unknown config action: {action}")
 
@@ -1353,18 +2066,18 @@ def setup_config(backend: Optional[str] = None, model: Optional[str] = None, rem
                 for key, value in remote_config.items():
                     existing_config[key] = value
             
-            # Update model if provided, otherwise default to base.en if missing
+            # Update model if provided, otherwise default to base if missing
             if model:
                 existing_config['model'] = model
             elif 'model' not in existing_config and not remote_config:
                 # Only set default model if not using remote backend
-                existing_config['model'] = 'base.en'
+                existing_config['model'] = 'base'
             
             # Add audio_feedback if missing
             if 'audio_feedback' not in existing_config:
                 existing_config['audio_feedback'] = True
-                existing_config['start_sound_volume'] = 0.5
-                existing_config['stop_sound_volume'] = 0.5
+                existing_config['start_sound_volume'] = 1.0
+                existing_config['stop_sound_volume'] = 1.0
                 existing_config['start_sound_path'] = 'ping-up.ogg'
                 existing_config['stop_sound_path'] = 'ping-down.ogg'
             
@@ -1408,6 +2121,72 @@ def edit_config():
         log_error(f"Failed to open editor: {e}")
 
 
+def configure_secondary_shortcut():
+    """Configure secondary shortcut and language"""
+    from rich.prompt import Prompt, Confirm
+    
+    config = ConfigManager()
+    
+    print("\n" + "="*60)
+    print("Secondary Shortcut Configuration")
+    print("="*60)
+    print("\nConfigure a second hotkey that will use a specific language for transcription.")
+    print("The primary shortcut will continue to use the default language from config.")
+    print()
+    
+    # Check if already configured
+    current_shortcut = config.get_setting('secondary_shortcut')
+    current_language = config.get_setting('secondary_language')
+    
+    if current_shortcut:
+        print(f"Current secondary shortcut: {current_shortcut}")
+        if current_language:
+            print(f"Current secondary language: {current_language}")
+        print()
+        if not Confirm.ask("Do you want to change the secondary shortcut?", default=False):
+            return
+    
+    # Prompt for shortcut
+    print("\nEnter the secondary shortcut key combination.")
+    print("Examples: SUPER+ALT+I, CTRL+SHIFT+L, F11")
+    print("Leave blank to disable secondary shortcut.")
+    shortcut = Prompt.ask("Secondary shortcut", default=current_shortcut or "")
+    
+    if not shortcut or shortcut.strip() == "":
+        # Disable secondary shortcut
+        config.set_setting('secondary_shortcut', None)
+        config.set_setting('secondary_language', None)
+        config.save_config()
+        log_success("Secondary shortcut disabled")
+        return
+    
+    # Prompt for language
+    print("\nEnter the language code for this shortcut.")
+    print("Examples: 'it' (Italian), 'en' (English), 'fr' (French), 'de' (German), 'es' (Spanish)")
+    print("Leave blank to disable secondary shortcut.")
+    language = Prompt.ask("Language code", default=current_language or "")
+    
+    if not language or language.strip() == "":
+        log_warning("Language code is required. Secondary shortcut not configured.")
+        return
+    
+    # Validate language code (basic check - 2-3 letter code)
+    language = language.strip().lower()
+    if len(language) < 2 or len(language) > 3:
+        log_warning("Language code should be 2-3 letters (e.g., 'it', 'en', 'fr')")
+        if not Confirm.ask("Continue anyway?", default=False):
+            return
+    
+    # Save configuration
+    config.set_setting('secondary_shortcut', shortcut.strip())
+    config.set_setting('secondary_language', language)
+    config.save_config()
+    
+    log_success(f"Secondary shortcut configured: {shortcut.strip()} (language: {language})")
+    print("\nNote: Restart hyprwhspr service for changes to take effect:")
+    print("  systemctl --user restart hyprwhspr")
+
+
 # ==================== Systemd Commands ====================
 
 def systemd_command(action: str):
@@ -1440,62 +2219,8 @@ def setup_systemd(mode: str = 'install'):
         log_error(f"Main executable not found or not executable: {main_exec}")
         return False
     
-    # Detect current backend to determine if Parakeet service is needed
-    current_backend = _detect_current_backend()
-    is_parakeet = current_backend == 'parakeet'
-    
     # Create user systemd directory
     USER_SYSTEMD_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # Handle Parakeet service if needed
-    if is_parakeet:
-        # Validate Parakeet components exist
-        if not PARAKEET_SCRIPT.exists():
-            log_error(f"Parakeet script not found at {PARAKEET_SCRIPT}")
-            return False
-        if not PARAKEET_VENV_DIR.exists():
-            log_error(f"Parakeet venv not found at {PARAKEET_VENV_DIR}")
-            return False
-        
-        # Clean old Parakeet service file first (following venv cleanup pattern)
-        parakeet_service_dest = USER_SYSTEMD_DIR / PARAKEET_SERVICE_NAME
-        if parakeet_service_dest.exists():
-            log_info("Removing existing Parakeet service file...")
-            # Stop and disable service if it's active
-            run_command(['systemctl', '--user', 'stop', PARAKEET_SERVICE_NAME], check=False)
-            run_command(['systemctl', '--user', 'disable', PARAKEET_SERVICE_NAME], check=False)
-            # Remove the service file
-            try:
-                parakeet_service_dest.unlink()
-            except Exception as e:
-                log_warning(f"Failed to remove old Parakeet service file: {e}")
-        
-        # Read Parakeet service template
-        parakeet_service_source = Path(HYPRWHSPR_ROOT) / 'config' / 'systemd' / PARAKEET_SERVICE_NAME
-        if not parakeet_service_source.exists():
-            log_error(f"Parakeet service template not found: {parakeet_service_source}")
-            return False
-        
-        try:
-            with open(parakeet_service_source, 'r', encoding='utf-8') as f:
-                parakeet_service_content = f.read()
-            
-            # Substitute paths
-            parakeet_service_content = parakeet_service_content.replace('/usr/lib/hyprwhspr', HYPRWHSPR_ROOT)
-            parakeet_service_content = parakeet_service_content.replace('/home/USER', str(USER_HOME))
-            parakeet_service_content = parakeet_service_content.replace(
-                '/home/USER/.local/share/hyprwhspr/parakeet-venv',
-                str(PARAKEET_VENV_DIR)
-            )
-            
-            # Write substituted content
-            with open(parakeet_service_dest, 'w', encoding='utf-8') as f:
-                f.write(parakeet_service_content)
-            
-            log_success("Parakeet service file created with correct paths")
-        except IOError as e:
-            log_error(f"Failed to read/write Parakeet service file: {e}")
-            return False
     
     # Read hyprwhspr service file template and substitute paths
     service_source = Path(HYPRWHSPR_ROOT) / 'config' / 'systemd' / SERVICE_NAME
@@ -1513,57 +2238,22 @@ def setup_systemd(mode: str = 'install'):
         # Substitute hardcoded path with actual HYPRWHSPR_ROOT
         service_content = service_content.replace('/usr/lib/hyprwhspr', HYPRWHSPR_ROOT)
         
-        # Conditionally inject Parakeet dependencies if Parakeet is configured
-        if is_parakeet:
-            # Add Parakeet service to After= line
-            if 'After=' in service_content:
-                # Find the After= line and add parakeet service
-                lines = service_content.split('\n')
-                for i, line in enumerate(lines):
-                    if line.startswith('After='):
-                        # Check if parakeet service is already in the line
-                        if PARAKEET_SERVICE_NAME not in line:
-                            lines[i] = line.rstrip() + ' ' + PARAKEET_SERVICE_NAME
-                        break
-                service_content = '\n'.join(lines)
-            
-            # Add Parakeet service to Wants= line (or create it if it doesn't exist)
-            if 'Wants=' in service_content:
-                lines = service_content.split('\n')
-                for i, line in enumerate(lines):
-                    if line.startswith('Wants='):
-                        # Check if parakeet service is already in the line
-                        if PARAKEET_SERVICE_NAME not in line:
-                            lines[i] = line.rstrip() + ' ' + PARAKEET_SERVICE_NAME
-                        break
-                service_content = '\n'.join(lines)
-            else:
-                # Insert Wants= line after After= line
-                lines = service_content.split('\n')
-                for i, line in enumerate(lines):
-                    if line.startswith('After='):
-                        lines.insert(i + 1, f'Wants={PARAKEET_SERVICE_NAME}')
-                        break
-                service_content = '\n'.join(lines)
-        
         # Write substituted content to user directory
         with open(service_dest, 'w', encoding='utf-8') as f:
             f.write(service_content)
-        
+
         log_success("User service file created with correct paths")
     except IOError as e:
         log_error(f"Failed to read/write service file: {e}")
         return False
-    
+
     # Reload systemd daemon
     run_command(['systemctl', '--user', 'daemon-reload'], check=False)
     
     if mode in ('install', 'enable'):
         # Enable & start services
         run_command(['systemctl', '--user', 'enable', '--now', YDOTOOL_UNIT], check=False)
-        if is_parakeet:
-            run_command(['systemctl', '--user', 'enable', '--now', PARAKEET_SERVICE_NAME], check=False)
-        
+
         # Check if hyprwhspr service was already running before enabling
         service_was_running = False
         try:
@@ -1587,9 +2277,8 @@ def setup_systemd(mode: str = 'install'):
         else:
             log_success("Systemd user services enabled and started")
     elif mode == 'disable':
-        if is_parakeet:
-            run_command(['systemctl', '--user', 'disable', '--now', PARAKEET_SERVICE_NAME], check=False)
         run_command(['systemctl', '--user', 'disable', '--now', SERVICE_NAME], check=False)
+        # Disable suspend/resume service if it exists
         log_success("Systemd user service disabled")
     
     return True
@@ -1597,21 +2286,16 @@ def setup_systemd(mode: str = 'install'):
 
 def systemd_status():
     """Show systemd service status"""
-    # Check if Parakeet backend is configured
-    current_backend = _detect_current_backend()
-    is_parakeet = current_backend == 'parakeet'
-    
     try:
-        if is_parakeet:
-            # Show status for both services
-            log_info("Parakeet service status:")
-            run_command(['systemctl', '--user', 'status', PARAKEET_SERVICE_NAME], check=False)
-            print()  # Add spacing
-            log_info("hyprwhspr service status:")
-            run_command(['systemctl', '--user', 'status', SERVICE_NAME], check=False)
-        else:
-            # Show status for hyprwhspr only
-            run_command(['systemctl', '--user', 'status', SERVICE_NAME], check=False)
+
+        log_info("hyprwhspr service status:")
+        run_command(['systemctl', '--user', 'status', SERVICE_NAME], check=False)
+        print()  # Add spacing
+
+        # Show suspend/resume service status if it exists
+        if (USER_SYSTEMD_DIR / RESUME_SERVICE_NAME).exists():
+            log_info("Suspend/resume handler status:")
+            run_command(['systemctl', '--user', 'status', RESUME_SERVICE_NAME], check=False)
     except subprocess.CalledProcessError as e:
         log_error(f"Failed to get status: {e}")
 
@@ -1662,22 +2346,10 @@ def _is_running_manually() -> bool:
 
 def systemd_restart():
     """Restart systemd service"""
-    # Check if Parakeet backend is configured
-    current_backend = _detect_current_backend()
-    is_parakeet = current_backend == 'parakeet'
-    
     log_info("Restarting service...")
     try:
-        if is_parakeet:
-            # Restart both services
-            run_command(['systemctl', '--user', 'restart', PARAKEET_SERVICE_NAME], check=False)
-            log_success("Parakeet service restarted")
-            run_command(['systemctl', '--user', 'restart', SERVICE_NAME], check=False)
-            log_success("hyprwhspr service restarted")
-        else:
-            # Restart hyprwhspr only
-            run_command(['systemctl', '--user', 'restart', SERVICE_NAME], check=False)
-            log_success("Service restarted")
+        run_command(['systemctl', '--user', 'restart', SERVICE_NAME], check=False)
+        log_success("Service restarted")
     except subprocess.CalledProcessError as e:
         log_error(f"Failed to restart service: {e}")
 
@@ -1751,9 +2423,8 @@ def setup_waybar(mode: str = 'install'):
                 "interval": 1,
                 "return-type": "json",
                 "exec-on-event": True,
-                "on-click": f"{HYPRWHSPR_ROOT}/config/hyprland/hyprwhspr-tray.sh toggle",
+                "on-click": f"{HYPRWHSPR_ROOT}/config/hyprland/hyprwhspr-tray.sh record",
                 "on-click-right": f"{HYPRWHSPR_ROOT}/config/hyprland/hyprwhspr-tray.sh restart",
-                "on-click-middle": f"{HYPRWHSPR_ROOT}/config/hyprland/hyprwhspr-tray.sh restart",
                 "tooltip": True
             }
         }
@@ -1777,7 +2448,13 @@ def setup_waybar(mode: str = 'install'):
                 config['modules-right'] = []
             
             if 'custom/hyprwhspr' not in config['modules-right']:
-                config['modules-right'].insert(0, 'custom/hyprwhspr')
+                # Try to insert after group/tray-expander
+                try:
+                    tray_index = config['modules-right'].index('group/tray-expander')
+                    config['modules-right'].insert(tray_index + 1, 'custom/hyprwhspr')
+                except ValueError:
+                    # group/tray-expander not found, append to end
+                    config['modules-right'].append('custom/hyprwhspr')
             
             # Write back
             with open(waybar_config, 'w', encoding='utf-8') as f:
@@ -1897,9 +2574,126 @@ def waybar_status():
         return False
 
 
+# ==================== Mic-OSD Commands ====================
+
+def _check_mic_osd_availability():
+    """Check mic-osd availability using the same Python the service will use.
+    
+    Returns:
+        tuple: (is_available: bool, reason: str)
+    """
+    # First, try with venv Python (same as service uses)
+    venv_python = VENV_DIR / 'bin' / 'python'
+    if venv_python.exists():
+        try:
+            lib_path = Path(__file__).parent.parent
+            # Use repr() to safely escape the path (handles quotes, backslashes, etc.)
+            lib_path_str = repr(str(lib_path))
+            check_code = f"""
+import sys
+sys.path.insert(0, {lib_path_str})
+from mic_osd import MicOSDRunner
+if MicOSDRunner.is_available():
+    print('AVAILABLE')
+else:
+    print('UNAVAILABLE:', MicOSDRunner.get_unavailable_reason())
+"""
+            result = subprocess.run(
+                [str(venv_python), '-c', check_code],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                output = result.stdout.strip()
+                if output == 'AVAILABLE':
+                    return True, ""
+                elif output.startswith('UNAVAILABLE:'):
+                    return False, output.replace('UNAVAILABLE:', '').strip()
+        except Exception as e:
+            # Fall through to current Python check
+            pass
+    
+    # Fallback: check with current Python environment
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from mic_osd import MicOSDRunner
+        
+        if MicOSDRunner.is_available():
+            return True, ""
+        else:
+            return False, MicOSDRunner.get_unavailable_reason()
+    except ImportError:
+        return False, "mic-osd module not found"
+
+
+def mic_osd_command(action: str):
+    """Handle mic-osd subcommands"""
+    if action == 'enable':
+        mic_osd_enable()
+    elif action == 'disable':
+        mic_osd_disable()
+    elif action == 'status':
+        mic_osd_status()
+    else:
+        log_error(f"Unknown mic-osd action: {action}")
+
+
+def mic_osd_enable():
+    """Enable the mic-osd visualization overlay"""
+    # Check if dependencies are available using service's Python
+    is_available, reason = _check_mic_osd_availability()
+    
+    if not is_available:
+        log_error(f"Cannot enable mic-osd: {reason}")
+        return False
+    
+    # Update config
+    config = ConfigManager()
+    config.set_setting('mic_osd_enabled', True)
+    config.save_config()
+    log_success("Mic-OSD visualization enabled")
+    log_info("The overlay will show during recording when the service is running")
+    return True
+
+
+def mic_osd_disable():
+    """Disable the mic-osd visualization overlay"""
+    config = ConfigManager()
+    config.set_setting('mic_osd_enabled', False)
+    config.save_config()
+    log_success("Mic-OSD visualization disabled")
+    return True
+
+
+def mic_osd_status():
+    """Check mic-osd status"""
+    config = ConfigManager()
+    enabled = config.get_setting('mic_osd_enabled', True)
+    
+    # Check dependencies using service's Python
+    deps_available, deps_reason = _check_mic_osd_availability()
+    
+    print("\nMic-OSD Status:")
+    print(f"  Enabled in config: {'Yes' if enabled else 'No'}")
+    print(f"  Dependencies available: {'Yes' if deps_available else 'No'}")
+    
+    if deps_available:
+        if enabled:
+            log_success("Mic-OSD will show during recording")
+        else:
+            log_info("Mic-OSD is disabled (use 'hyprwhspr mic-osd enable' to enable)")
+    else:
+        log_warning(f"Mic-OSD cannot run: {deps_reason}")
+
+    return enabled and deps_available
+
+
 # ==================== Model Commands ====================
 
-def model_command(action: str, model_name: str = 'base.en'):
+def model_command(action: str, model_name: str = 'base'):
     """Handle model subcommands"""
     if action == 'download':
         download_model(model_name)
@@ -1911,7 +2705,7 @@ def model_command(action: str, model_name: str = 'base.en'):
         log_error(f"Unknown model action: {action}")
 
 
-def download_model(model_name: str = 'base.en'):
+def download_model(model_name: str = 'base'):
     """Download pywhispercpp model with progress feedback"""
     log_info(f"Downloading pywhispercpp model: {model_name}")
     
@@ -2038,9 +2832,14 @@ def status_command():
     
     # Check user config
     print("\n[User Config]")
-    config_file = USER_CONFIG_DIR / 'config.json'
+    config_file = paths.CONFIG_FILE
     if config_file.exists():
         log_success(f"Config exists: {config_file}")
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                json.load(f)
+        except json.JSONDecodeError as e:
+            log_warning(f"Config file is invalid, hyprwhspr will be using default config. Please check config line {e.lineno}, column  {e.colno}.")
     else:
         log_warning("Config file not found")
     
@@ -2090,73 +2889,78 @@ def check_permissions():
 def setup_permissions():
     """Setup permissions (requires sudo)"""
     log_info("Setting up permissions...")
-    
+
     # Safer way to get username
     username = os.environ.get('SUDO_USER') or os.environ.get('USER') or getpass.getuser()
     if not username:
         log_error("Could not determine username for permissions setup.")
         return False
-    
+
+    any_failures = False
+
     # Add user to required groups
     try:
-        run_sudo_command(['usermod', '-a', '-G', 'input,audio,tty', username], check=False)
-        log_success("Added user to required groups")
+        result = run_sudo_command(['usermod', '-a', '-G', 'input,audio,tty', username], check=False)
+        if result.returncode == 0:
+            log_success("Added user to required groups")
+        else:
+            log_warning(f"Failed to add user to groups (exit code {result.returncode})")
+            log_info("You may need to run manually: sudo usermod -a -G input,audio,tty $USER")
+            any_failures = True
     except Exception as e:
         log_warning(f"Failed to add user to groups: {e}")
-    
+        any_failures = True
+
     # Load uinput module
     if not Path('/dev/uinput').exists():
         log_info("Loading uinput module...")
-        run_sudo_command(['modprobe', 'uinput'], check=False)
+        try:
+            result = run_sudo_command(['modprobe', 'uinput'], check=False)
+            if result.returncode != 0:
+                log_warning("Failed to load uinput module")
+                any_failures = True
+        except Exception as e:
+            log_warning(f"Failed to load uinput module: {e}")
+            any_failures = True
         import time
         time.sleep(2)
-    
+
     # Create udev rule
     udev_rule = Path('/etc/udev/rules.d/99-uinput.rules')
     if not udev_rule.exists():
         log_info("Creating udev rule...")
         rule_content = '# Allow members of the input group to access uinput device\nKERNEL=="uinput", GROUP="input", MODE="0660"\n'
         try:
-            run_sudo_command(['tee', str(udev_rule)], input_data=rule_content.encode(), check=False)
-            log_success("udev rule created")
+            result = run_sudo_command(['tee', str(udev_rule)], input_data=rule_content.encode(), check=False)
+            if result.returncode == 0:
+                log_success("udev rule created")
+            else:
+                log_warning(f"Failed to create udev rule (exit code {result.returncode})")
+                log_info("You may need to run manually: sudo tee /etc/udev/rules.d/99-uinput.rules")
+                any_failures = True
         except Exception as e:
             log_warning(f"Failed to create udev rule: {e}")
+            any_failures = True
     else:
         log_info("udev rule already exists")
-    
+
     # Reload udev
     try:
-        run_sudo_command(['udevadm', 'control', '--reload-rules'], check=False)
-        run_sudo_command(['udevadm', 'trigger', '--name-match=uinput'], check=False)
-        log_success("udev rules reloaded")
+        result1 = run_sudo_command(['udevadm', 'control', '--reload-rules'], check=False)
+        result2 = run_sudo_command(['udevadm', 'trigger', '--name-match=uinput'], check=False)
+        if result1.returncode == 0 and result2.returncode == 0:
+            log_success("udev rules reloaded")
+        else:
+            log_warning("Failed to reload udev rules")
+            log_info("You may need to run manually: sudo udevadm control --reload-rules && sudo udevadm trigger")
+            any_failures = True
     except Exception as e:
         log_warning(f"Failed to reload udev rules: {e}")
-    
+        any_failures = True
+
+    if any_failures:
+        log_warning("Some permission setup commands failed. You may need to run them manually as root.")
     log_warning("You may need to log out/in for new group memberships to apply")
-
-
-# ==================== Validate Command ====================
-
-def cleanup_venv_command():
-    """Remove the venv directory completely"""
-    if not VENV_DIR.exists():
-        log_info("No venv found")
-        return True
-    
-    log_warning("This will remove the entire Python virtual environment.")
-    log_warning("All installed packages (including pywhispercpp) will be deleted.")
-    if not Confirm.ask("Are you sure?", default=False):
-        log_info("Cleanup cancelled")
-        return False
-    
-    try:
-        import shutil
-        shutil.rmtree(VENV_DIR)
-        log_success("Venv removed successfully")
-        return True
-    except Exception as e:
-        log_error(f"Failed to remove venv: {e}")
-        return False
 
 
 # ==================== Backend Management Commands ====================
@@ -2190,24 +2994,42 @@ def backend_repair_command():
                 log_warning("Venv Python binary cannot be executed")
                 venv_corrupted = True
     
-    # Check pywhispercpp installation
-    pywhispercpp_missing = False
-    if venv_python.exists() and not venv_corrupted:
+    # Check backend module installation based on configured backend
+    backend_missing = False
+    backend_module = None
+    configured_backend = None
+
+    # Get the configured backend to know which module to check
+    try:
+        config_manager = ConfigManager()
+        configured_backend = config_manager.get_setting('transcription_backend', 'pywhispercpp')
+        configured_backend = normalize_backend(configured_backend)
+    except Exception:
+        pass
+
+    # Determine which module to check based on backend
+    if configured_backend == 'onnx-asr':
+        backend_module = 'onnx_asr'
+    elif configured_backend in ['cpu', 'nvidia', 'vulkan', 'amd', 'pywhispercpp']:
+        backend_module = 'pywhispercpp'
+    # For rest-api, realtime-ws, parakeet - no local module to check
+
+    if backend_module and venv_python.exists() and not venv_corrupted:
         try:
             result = subprocess.run(
-                [str(venv_python), '-c', 'import pywhispercpp'],
+                [str(venv_python), '-c', f'import {backend_module}'],
                 check=False,
                 capture_output=True,
                 text=True,
                 timeout=5
             )
             if result.returncode != 0:
-                log_warning("pywhispercpp is not installed in venv")
-                pywhispercpp_missing = True
+                log_warning(f"{backend_module} is not installed in venv (required for {configured_backend} backend)")
+                backend_missing = True
         except Exception:
             pass
-    
-    if not venv_corrupted and not pywhispercpp_missing:
+
+    if not venv_corrupted and not backend_missing:
         log_success("No issues detected")
         return True
     
@@ -2235,20 +3057,20 @@ def backend_repair_command():
             setup_python_venv()
             log_success("Venv recreated")
     
-    if pywhispercpp_missing:
+    if backend_missing:
         print("\nIssues found:")
-        print("  • pywhispercpp is not installed")
+        print(f"  • {backend_module} is not installed (required for {configured_backend} backend)")
         print("\nOptions:")
-        print("  [1] Reinstall backend (detect and install)")
+        print("  [1] Reinstall backend")
         print("  [2] Skip (manual repair required)")
-        
+
         choice = Prompt.ask("Select option", choices=['1', '2'], default='1')
         if choice == '1':
-            # Detect backend type from config
-            current_backend = _detect_current_backend()
-            if current_backend and current_backend in ['cpu', 'nvidia', 'amd']:
-                log_info(f"Reinstalling {current_backend.upper()} backend...")
-                if install_backend(current_backend):
+            # Use the configured backend for reinstallation
+            if configured_backend and configured_backend in ['cpu', 'nvidia', 'amd', 'vulkan', 'onnx-asr']:
+                log_info(f"Reinstalling {configured_backend.upper()} backend...")
+                # Use force_rebuild=True to ensure clean reinstall
+                if install_backend(configured_backend, force_rebuild=True):
                     log_success("Backend reinstalled successfully")
                 else:
                     log_error("Backend reinstallation failed")
@@ -2430,6 +3252,8 @@ def validate_command():
     # Detect current backend to determine what to validate
     current_backend = _detect_current_backend()
     is_rest_api = current_backend in ['rest-api', 'parakeet', 'remote', 'realtime-ws']
+    is_onnx_asr = current_backend == 'onnx-asr'
+    is_pywhispercpp = current_backend in ['cpu', 'nvidia', 'amd', 'vulkan', 'pywhispercpp']
     
     # Check static files
     required_files = [
@@ -2480,8 +3304,45 @@ def validate_command():
         log_error("✗ sounddevice not available")
         all_ok = False
     
-    # Check pywhispercpp (only for local backends)
-    if not is_rest_api:
+    # Check backend-specific packages
+    if is_onnx_asr:
+        # Check onnx-asr availability
+        onnx_asr_available = False
+        if venv_python.exists():
+            try:
+                result = subprocess.run(
+                    [str(venv_python), '-c', 'import onnx_asr'],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    onnx_asr_available = True
+            except Exception:
+                pass
+        
+        # Fallback: check in current environment if not found in venv
+        if not onnx_asr_available:
+            try:
+                import onnx_asr  # noqa: F401
+                onnx_asr_available = True
+            except ImportError:
+                onnx_asr_available = False
+        
+        if onnx_asr_available:
+            log_success("✓ onnx-asr available")
+        else:
+            log_warning("⚠ onnx-asr not available")
+            print("")
+            print("To use ONNX-ASR backend, run: hyprwhspr setup")
+            print("This will install the ONNX-ASR backend.")
+            print("")
+        
+        # Skip model file check for onnx-asr (uses different model format)
+        
+    elif is_pywhispercpp:
+        # Check pywhispercpp (only for pywhispercpp backends)
         pywhispercpp_available = False
         
         if venv_python.exists():
@@ -2538,8 +3399,8 @@ def validate_command():
             print("(or use REST API backend by setting 'transcription_backend': 'rest-api' in config.json)")
             print("")
         
-        # Check base model (only for local backends)
-        model_file = PYWHISPERCPP_MODELS_DIR / 'ggml-base.en.bin'
+        # Check base model (only for pywhispercpp backends)
+        model_file = PYWHISPERCPP_MODELS_DIR / 'ggml-base.bin'
         if model_file.exists():
             log_success(f"✓ Base model exists: {model_file}")
         else:
@@ -2557,18 +3418,358 @@ def validate_command():
             else:
                 log_error("✗ Parakeet script missing")
                 all_ok = False
-    
+
+    # Check ydotool version (required for paste injection)
+    ydotool_ok, ydotool_version, ydotool_msg = _check_ydotool_version()
+    if ydotool_ok:
+        log_success(f"✓ {ydotool_msg}")
+    elif ydotool_version:
+        log_error(f"✗ {ydotool_msg}")
+        log_error("  Paste injection will output garbage with this version.")
+        log_error("  Ubuntu/Debian users: Run scripts/install-deps.sh to fix this,")
+        log_error("  or manually install ydotool 1.0+ from Debian backports:")
+        log_error("  wget http://deb.debian.org/debian/pool/main/y/ydotool/ydotool_1.0.4-2~bpo13+1_amd64.deb")
+        log_error("  sudo dpkg -i ydotool_1.0.4-2~bpo13+1_amd64.deb")
+        all_ok = False
+    else:
+        log_error(f"✗ {ydotool_msg}")
+        log_error("  ydotool is required for paste injection.")
+        all_ok = False
+
+    # Validate configuration for potential conflicts
+    try:
+        from .config_manager import ConfigManager
+        config = ConfigManager()
+        use_hypr_bindings = config.get_setting('use_hypr_bindings', False)
+        grab_keys = config.get_setting('grab_keys', False)
+
+        if use_hypr_bindings:
+            log_info("ℹ Using Hyprland compositor bindings (evdev disabled)")
+            if grab_keys:
+                log_warning("⚠ Warning: use_hypr_bindings=true but grab_keys=true")
+                log_warning("  Recommendation: Set grab_keys=false when using compositor bindings")
+    except Exception:
+        pass  # Config validation is optional, don't fail if it errors
+
     if all_ok:
         log_success("Validation passed")
     else:
         log_error("Validation failed - some components are missing")
-    
+
     return all_ok
+
+
+# ==================== Test Command ====================
+
+def test_command(live: bool = False, mic_only: bool = False):
+    """Test microphone and backend connectivity end-to-end"""
+    import time
+    import wave
+    from io import BytesIO
+
+    print("\n" + "="*60)
+    print("hyprwhspr Diagnostic Test")
+    print("="*60)
+
+    all_passed = True
+
+    # ===== MICROPHONE TEST =====
+    print("\n[Microphone]")
+
+    try:
+        from .audio_capture import AudioCapture
+    except ImportError:
+        from audio_capture import AudioCapture
+
+    # Ensure audio is defined on all code paths (e.g., no devices found)
+    audio = None
+
+    try:
+        # Check for available devices
+        devices = AudioCapture.get_available_input_devices()
+        if not devices:
+            log_error("No input devices found")
+            all_passed = False
+        else:
+            log_success(f"Found {len(devices)} input device(s)")
+
+            # Get configured device from config
+            config = ConfigManager()
+            device_id = config.get_setting('audio_device_id', None)
+
+            # Initialize audio capture
+            audio = AudioCapture(device_id=device_id, config_manager=config)
+
+            if audio.is_available():
+                device_info = audio.get_current_device_info()
+                if device_info:
+                    log_success(f"Using: {device_info['name']}")
+                else:
+                    log_success("Audio device available")
+            else:
+                log_error("Failed to initialize audio capture")
+                all_passed = False
+
+    except Exception as e:
+        log_error(f"Microphone test failed: {e}")
+        all_passed = False
+        audio = None
+
+    # If mic-only, stop here
+    if mic_only:
+        print("\n" + "-"*60)
+        if all_passed:
+            log_success("Microphone test passed")
+        else:
+            log_error("Microphone test failed")
+        return all_passed
+
+    # ===== BACKEND TEST =====
+    print("\n[Backend]")
+
+    config = ConfigManager()
+    backend = config.get_setting('transcription_backend', 'pywhispercpp')
+    backend = normalize_backend(backend)
+
+    log_info(f"Configured backend: {backend}")
+
+    backend_ready = False
+
+    if backend == 'rest-api':
+        # Test REST API connectivity
+        endpoint_url = config.get_setting('rest_endpoint_url')
+        if not endpoint_url:
+            log_error("REST endpoint URL not configured")
+            all_passed = False
+        else:
+            log_success(f"Endpoint: {endpoint_url}")
+
+            # Check credentials
+            provider_id = config.get_setting('rest_api_provider')
+            if provider_id:
+                api_key = get_credential(provider_id)
+                if api_key:
+                    log_success(f"Credentials configured (provider: {provider_id})")
+                    backend_ready = True
+                else:
+                    log_error(f"API key not found for provider: {provider_id}")
+                    all_passed = False
+            else:
+                # Check for legacy api key
+                api_key = config.get_setting('rest_api_key')
+                if api_key:
+                    log_success("Credentials configured (legacy)")
+                    backend_ready = True
+                else:
+                    log_warning("No API credentials configured")
+                    # May still work if endpoint doesn't require auth
+                    backend_ready = True
+
+    elif backend == 'realtime-ws':
+        # Test WebSocket configuration
+        provider_id = config.get_setting('websocket_provider')
+        model_id = config.get_setting('websocket_model')
+
+        if not provider_id:
+            log_error("WebSocket provider not configured")
+            all_passed = False
+        elif not model_id:
+            log_error("WebSocket model not configured")
+            all_passed = False
+        else:
+            api_key = get_credential(provider_id)
+            if api_key:
+                log_success(f"Provider: {provider_id}, Model: {model_id}")
+                log_success("Credentials configured")
+                backend_ready = True
+            else:
+                log_error(f"API key not found for provider: {provider_id}")
+                all_passed = False
+
+    elif backend == 'onnx-asr':
+        # Test ONNX-ASR model availability
+        try:
+            import onnx_asr
+            model_name = config.get_setting('onnx_asr_model', 'nemo-parakeet-tdt-0.6b-v3')
+            log_success(f"onnx-asr available, model: {model_name}")
+            backend_ready = True
+        except ImportError:
+            log_error("onnx-asr not installed")
+            all_passed = False
+
+    elif backend in ('pywhispercpp', 'nvidia', 'cpu', 'vulkan'):
+        # Test pywhispercpp model availability (covers all local whisper variants)
+        try:
+            try:
+                from pywhispercpp.model import Model
+            except ImportError:
+                from pywhispercpp import Model
+
+            model_name = config.get_setting('model', 'base')
+            model_file = PYWHISPERCPP_MODELS_DIR / f"ggml-{model_name}.bin"
+
+            # Try English-only variant if base not found
+            if not model_file.exists() and not model_name.endswith('.en'):
+                model_file = PYWHISPERCPP_MODELS_DIR / f"ggml-{model_name}.en.bin"
+
+            if model_file.exists():
+                log_success(f"pywhispercpp available, model: {model_name}")
+                backend_ready = True
+            else:
+                log_error(f"Model file not found: {model_file}")
+                log_info(f"Download with: hyprwhspr model download {model_name}")
+                all_passed = False
+        except ImportError:
+            log_error("pywhispercpp not installed")
+            all_passed = False
+    else:
+        log_warning(f"Unknown backend: {backend}")
+        all_passed = False
+
+    # ===== TRANSCRIPTION TEST =====
+    print("\n[Transcription]")
+
+    if not backend_ready:
+        log_warning("Skipping transcription test (backend not ready)")
+    else:
+        # Get audio data - either from test.wav or live recording
+        audio_data = None
+        audio_source = None
+
+        if live:
+            # Record live audio
+            if audio and audio.is_available():
+                print("  Recording for 3 seconds... speak now!")
+                try:
+                    audio.start_recording()
+                    time.sleep(3.0)
+                    audio_data = audio.stop_recording()
+
+                    if audio_data is not None and len(audio_data) > 0:
+                        # Calculate audio level
+                        import numpy as np
+                        rms = np.sqrt(np.mean(audio_data**2))
+                        db = 20 * np.log10(max(rms, 1e-10))
+                        log_success(f"Recorded {len(audio_data)/16000:.1f}s audio (level: {db:.0f}dB)")
+                        audio_source = "live recording"
+
+                        # Warn if audio is very quiet (likely silence)
+                        if db < -40:
+                            log_warning("Audio level very low - check microphone")
+                    else:
+                        log_error("No audio data captured")
+                        all_passed = False
+                except Exception as e:
+                    log_error(f"Recording failed: {e}")
+                    all_passed = False
+            else:
+                log_error("Cannot record - audio capture not available")
+                all_passed = False
+        else:
+            # Use test.wav
+            test_wav_path = Path(HYPRWHSPR_ROOT) / 'share' / 'assets' / 'test.wav'
+
+            if not test_wav_path.exists():
+                log_error(f"Test audio file not found: {test_wav_path}")
+                log_info("Use --live to record audio instead")
+                all_passed = False
+            else:
+                try:
+                    import numpy as np
+                    with wave.open(str(test_wav_path), 'rb') as wf:
+                        # Read audio data
+                        frames = wf.readframes(wf.getnframes())
+                        sample_rate = wf.getframerate()
+
+                        # Convert to float32 numpy array
+                        sample_width = wf.getsampwidth()
+                        if sample_width == 2:  # 16-bit
+                            audio_data = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+                        elif sample_width == 4:  # 32-bit
+                            audio_data = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+                        else:
+                            audio_data = np.frombuffer(frames, dtype=np.float32)
+
+                        # Resample to 16kHz if needed
+                        if sample_rate != 16000:
+                            from scipy import signal
+                            audio_data = signal.resample(audio_data, int(len(audio_data) * 16000 / sample_rate))
+
+                        duration = len(audio_data) / 16000
+                        log_success(f"Loaded test.wav ({duration:.1f}s)")
+                        audio_source = "test.wav"
+
+                except Exception as e:
+                    log_error(f"Failed to load test.wav: {e}")
+                    all_passed = False
+
+        # Transcribe if we have audio
+        if audio_data is not None and len(audio_data) > 0:
+            try:
+                from .whisper_manager import WhisperManager
+            except ImportError:
+                from whisper_manager import WhisperManager
+
+            try:
+                log_info("Initializing backend...")
+                whisper = WhisperManager(config_manager=config)
+
+                if not whisper.initialize():
+                    log_error("Failed to initialize transcription backend")
+                    all_passed = False
+                else:
+                    duration = len(audio_data) / 16000
+                    if duration > 5:
+                        log_info(f"Transcribing {duration:.0f}s of audio (this may take a moment)...")
+                    else:
+                        log_info("Transcribing...")
+
+                    # For realtime-ws, we need to handle differently
+                    if backend == 'realtime-ws':
+                        # Realtime requires streaming - not ideal for test
+                        # Just verify connection worked during initialize()
+                        log_success("WebSocket connected successfully")
+                        log_info("(Realtime transcription requires streaming audio)")
+                        whisper.cleanup()
+                    else:
+                        result = whisper.transcribe_audio(audio_data)
+
+                        if result:
+                            # Clean up the result for display
+                            result_clean = result.strip()
+                            if result_clean:
+                                log_success("Transcription successful")
+                                print(f"  -> \"{result_clean}\"")
+                            else:
+                                log_warning("Transcription returned empty result")
+                                log_info("This may be normal if audio was silence")
+                        else:
+                            log_error("Transcription returned no result")
+                            all_passed = False
+
+                        # Cleanup
+                        if hasattr(whisper, 'cleanup'):
+                            whisper.cleanup()
+
+            except Exception as e:
+                log_error(f"Transcription test failed: {e}")
+                import traceback
+                traceback.print_exc()
+                all_passed = False
+
+    # ===== SUMMARY =====
+    print("\n" + "-"*60)
+    if all_passed:
+        log_success("All tests passed!")
+    else:
+        log_error("Some tests failed")
+
+    return all_passed
 
 
 # ==================== Uninstall Command ====================
 
-def uninstall_command(keep_models: bool = False, remove_permissions: bool = False, 
+def uninstall_command(keep_models: bool = False, remove_permissions: bool = False,
                      skip_permissions: bool = False, yes: bool = False):
     """Completely remove hyprwhspr and all user data"""
     print("\n" + "="*60)
@@ -2583,7 +3784,9 @@ def uninstall_command(keep_models: bool = False, remove_permissions: bool = Fals
         items_to_remove.append(f"Systemd service: {SERVICE_NAME}")
     if (USER_SYSTEMD_DIR / PARAKEET_SERVICE_NAME).exists():
         items_to_remove.append(f"Systemd service: {PARAKEET_SERVICE_NAME}")
-    
+    if (USER_SYSTEMD_DIR / RESUME_SERVICE_NAME).exists():
+        items_to_remove.append(f"Systemd service: {RESUME_SERVICE_NAME} (deprecated)")
+
     # Waybar integration
     waybar_module = USER_HOME / '.config' / 'waybar' / 'hyprwhspr-module.jsonc'
     if waybar_module.exists():
@@ -2656,14 +3859,21 @@ def uninstall_command(keep_models: bool = False, remove_permissions: bool = Fals
             run_command(['systemctl', '--user', 'disable', SERVICE_NAME], check=False)
             (USER_SYSTEMD_DIR / SERVICE_NAME).unlink(missing_ok=True)
             log_success(f"Removed {SERVICE_NAME}")
-        
+
         # Stop and disable Parakeet service
         if (USER_SYSTEMD_DIR / PARAKEET_SERVICE_NAME).exists():
             run_command(['systemctl', '--user', 'stop', PARAKEET_SERVICE_NAME], check=False)
             run_command(['systemctl', '--user', 'disable', PARAKEET_SERVICE_NAME], check=False)
             (USER_SYSTEMD_DIR / PARAKEET_SERVICE_NAME).unlink(missing_ok=True)
             log_success(f"Removed {PARAKEET_SERVICE_NAME}")
-        
+
+        # Stop and disable deprecated resume service
+        if (USER_SYSTEMD_DIR / RESUME_SERVICE_NAME).exists():
+            run_command(['systemctl', '--user', 'stop', RESUME_SERVICE_NAME], check=False)
+            run_command(['systemctl', '--user', 'disable', RESUME_SERVICE_NAME], check=False)
+            (USER_SYSTEMD_DIR / RESUME_SERVICE_NAME).unlink(missing_ok=True)
+            log_success(f"Removed {RESUME_SERVICE_NAME}")
+
         # Reload systemd daemon
         run_command(['systemctl', '--user', 'daemon-reload'], check=False)
     except Exception as e:

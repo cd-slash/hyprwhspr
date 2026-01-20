@@ -7,18 +7,100 @@ import sys
 import threading
 import select
 import time
+import subprocess
+import json
+import re
 from typing import Callable, Optional, List, Set, Dict
 from pathlib import Path
 
 try:
-    import evdev
-    from evdev import InputDevice, categorize, ecodes, UInput
-except (ImportError, ModuleNotFoundError) as e:
-    print("ERROR: python-evdev is not available in this Python environment.", file=sys.stderr)
-    print(f"ImportError: {e}", file=sys.stderr)
-    print("\nThis is a required dependency. Please install it:", file=sys.stderr)
-    print("  pacman -S python-evdev    # system-wide on Arch", file=sys.stderr)
-    sys.exit(1)
+    from .dependencies import require_package
+except ImportError:
+    from dependencies import require_package
+
+evdev = require_package('evdev')
+from evdev import InputDevice, categorize, ecodes, UInput
+
+
+# Layout detection for non-QWERTY keyboard layouts
+# X11 keycode = evdev keycode + 8
+_X11_TO_EVDEV_OFFSET = 8
+_layout_map_cache = None
+
+
+def _get_layout_from_hyprland() -> tuple[str, str]:
+    """Get keyboard layout and variant from Hyprland"""
+    try:
+        result = subprocess.run(
+            ['hyprctl', 'devices', '-j'],
+            capture_output=True, text=True, timeout=2
+        )
+        devices = json.loads(result.stdout)
+        for kb in devices.get('keyboards', []):
+            layout = kb.get('layout', '')
+            variant = kb.get('variant', '')
+            if layout:
+                return layout, variant
+    except Exception:
+        pass
+    return 'us', ''
+
+
+def _compile_and_parse_keymap(layout: str, variant: str = '') -> dict[str, int]:
+    """
+    Compile XKB keymap and parse character → evdev keycode mapping.
+
+    Uses xkbcli to compile the keymap for the given layout/variant,
+    then parses the output to build a mapping from characters to
+    their physical evdev keycodes.
+
+    This enables shortcuts like "SUPER+D" to work correctly on any
+    keyboard layout (Colemak, Dvorak, Workman, etc.) by finding which
+    physical key produces the character 'd' in that layout.
+    """
+    try:
+        cmd = ['xkbcli', 'compile-keymap', '--layout', layout]
+        if variant:
+            cmd.extend(['--variant', variant])
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        keymap_text = result.stdout
+    except Exception:
+        return {}
+
+    char_to_evdev = {}
+
+    # Parse XKB key name → X11 keycode from keycodes section
+    xkb_to_x11 = {}
+    for match in re.finditer(r'<(\w+)>\s*=\s*(\d+)', keymap_text):
+        xkb_name, x11_code = match.groups()
+        xkb_to_x11[xkb_name] = int(x11_code)
+
+    # Parse key symbols: key <AD01> { [ q, Q, ... ] };
+    for match in re.finditer(r'key\s+<(\w+)>\s*\{\s*\[\s*(\w+)', keymap_text):
+        xkb_name, char = match.groups()
+        # Only map single lowercase letters
+        if len(char) == 1 and char.islower() and xkb_name in xkb_to_x11:
+            char_to_evdev[char] = xkb_to_x11[xkb_name] - _X11_TO_EVDEV_OFFSET
+
+    return char_to_evdev
+
+
+def _get_layout_map() -> dict[str, int]:
+    """
+    Get cached character → evdev keycode map for current keyboard layout.
+
+    Returns a dict mapping lowercase letters to their physical evdev keycodes.
+    For QWERTY this is a no-op (returns empty dict, falling back to defaults).
+    For other layouts like Colemak, 'd' might map to KEY_G (evdev 34).
+    """
+    global _layout_map_cache
+    if _layout_map_cache is None:
+        layout, variant = _get_layout_from_hyprland()
+        _layout_map_cache = _compile_and_parse_keymap(layout, variant)
+        if _layout_map_cache and (layout != 'us' or variant):
+            layout_name = f"{layout}/{variant}" if variant else layout
+            print(f"[LAYOUT] Detected {layout_name}, using layout-aware key mapping")
+    return _layout_map_cache
 
 
 # Key aliases mapping to evdev KEY_* constants
@@ -141,6 +223,7 @@ class GlobalShortcuts:
         self.listener_thread = None
         self.is_running = False
         self.stop_event = threading.Event()
+        self._device_lock = threading.Lock()  # Protect device list from concurrent modification
 
         # Virtual keyboard for re-emitting non-shortcut keys
         self.uinput = None
@@ -164,78 +247,100 @@ class GlobalShortcuts:
         
     def _discover_keyboards(self):
         """Discover and initialize input devices that can emit the configured shortcut"""
-        self.devices = []
-        self.device_fds = {}
-        
-        try:
-            # Find all input devices
-            all_device_paths = evdev.list_devices()
-            devices = [evdev.InputDevice(path) for path in all_device_paths]
-            
-            # If a specific device path is selected, only use that device and skip auto-detection
-            if self.selected_device_path:
-                selected_device = None
+        with self._device_lock:
+            self.devices = []
+            self.device_fds = {}
+
+            try:
+                # Find all input devices
+                all_device_paths = evdev.list_devices()
+                devices = [evdev.InputDevice(path) for path in all_device_paths]
+                
+                # If a specific device path is selected, only use that device and skip auto-detection
+                if self.selected_device_path:
+                    selected_device = None
+                    for device in devices:
+                        if device.path == self.selected_device_path:
+                            selected_device = device
+                        else:
+                            # Close devices that don't match the selected path
+                            device.close()
+                    
+                    if selected_device is None:
+                        print(f"[WARN] Selected device {self.selected_device_path} not found!")
+                        return
+                    
+                    devices = [selected_device]
+                
                 for device in devices:
-                    if device.path == self.selected_device_path:
-                        selected_device = device
+                    # Require EV_KEY events
+                    capabilities = device.capabilities()
+                    if ecodes.EV_KEY not in capabilities:
+                        if self.selected_device_path:
+                            print(f"[ERROR] Selected device '{device.name}' ({device.path}) does not support keyboard events (EV_KEY)")
+                            print("[ERROR] This device cannot be used for keyboard shortcuts")
+                            device.close()
+                            return
+                        device.close()
+                        continue
+
+                    # Skip mice and other non-keyboard devices (unless explicitly selected)
+                    if not self.selected_device_path and not self._is_keyboard_device(device):
+                        device.close()
+                        continue
+
+                    # Check that device can emit ALL keys required for the shortcut
+                    available_keys = set(capabilities[ecodes.EV_KEY])
+                    if not self.target_keys.issubset(available_keys):
+                        if self.selected_device_path:
+                            missing_keys = self.target_keys - available_keys
+                            missing_key_names = [self._keycode_to_name(k) for k in missing_keys]
+                            print(f"[ERROR] Selected device '{device.name}' ({device.path}) cannot emit all keys required for shortcut '{self.primary_key}'")
+                            print(f"[ERROR] Missing keys: {', '.join(missing_key_names)}")
+                            print("[ERROR] This device is incompatible with the configured shortcut")
+                            device.close()
+                            return
+                        device.close()
+                        continue
+                    
+                    # Device can emit all required keys - test accessibility
+                    # When grab_keys is true, test grab capability; when false, just test read access
+                    if self.grab_keys:
+                        # Retry logic to handle cases where device is temporarily busy (e.g., during service restart)
+                        grab_test_success = False
+                        for retry in range(2):
+                            try:
+                                device.grab()
+                                device.ungrab()
+                                grab_test_success = True
+                                break
+                            except (OSError, IOError) as e:
+                                if retry < 1:  # Don't sleep on last retry
+                                    # Device might be busy from previous process - wait a bit
+                                    time.sleep(0.05)
+                                    continue
+                                # Last retry failed - this is a real error
+                                if self.selected_device_path:
+                                    print(f"[ERROR] Cannot access selected device '{device.name}' ({device.path}): {e}")
+                                    print("[ERROR] This usually means you need root or input group membership")
+                                    print("[ERROR]   Run: sudo usermod -aG input $USER (then log out and back in)")
+                                    device.close()
+                                    return
+                                print(f"[WARN] Cannot access device {device.name}: {e}")
+                                print("[WARN]   This usually means you need root or input group membership")
+                                device.close()
+                                break
+                        
+                        if not grab_test_success:
+                            continue
                     else:
-                        # Close devices that don't match the selected path
-                        device.close()
-                
-                if selected_device is None:
-                    print(f"[WARN] Selected device {self.selected_device_path} not found!")
-                    return
-                
-                devices = [selected_device]
-            
-            for device in devices:
-                # Require EV_KEY events
-                capabilities = device.capabilities()
-                if ecodes.EV_KEY not in capabilities:
-                    if self.selected_device_path:
-                        print(f"[ERROR] Selected device '{device.name}' ({device.path}) does not support keyboard events (EV_KEY)")
-                        print("[ERROR] This device cannot be used for keyboard shortcuts")
-                        device.close()
-                        return
-                    device.close()
-                    continue
-
-                # Skip mice and other non-keyboard devices (unless explicitly selected)
-                if not self.selected_device_path and not self._is_keyboard_device(device):
-                    device.close()
-                    continue
-
-                # Check that device can emit ALL keys required for the shortcut
-                available_keys = set(capabilities[ecodes.EV_KEY])
-                if not self.target_keys.issubset(available_keys):
-                    if self.selected_device_path:
-                        missing_keys = self.target_keys - available_keys
-                        missing_key_names = [self._keycode_to_name(k) for k in missing_keys]
-                        print(f"[ERROR] Selected device '{device.name}' ({device.path}) cannot emit all keys required for shortcut '{self.primary_key}'")
-                        print(f"[ERROR] Missing keys: {', '.join(missing_key_names)}")
-                        print("[ERROR] This device is incompatible with the configured shortcut")
-                        device.close()
-                        return
-                    device.close()
-                    continue
-                
-                # Device can emit all required keys - test accessibility
-                # When grab_keys is true, test grab capability; when false, just test read access
-                if self.grab_keys:
-                    # Retry logic to handle cases where device is temporarily busy (e.g., during service restart)
-                    grab_test_success = False
-                    for retry in range(2):
+                        # When grab_keys is false, still test if we can read from the device
+                        # This prevents adding inaccessible devices that will error in _event_loop()
                         try:
-                            device.grab()
-                            device.ungrab()
-                            grab_test_success = True
-                            break
+                            # Try to read capabilities as a basic accessibility test
+                            # This will fail if we don't have read permission
+                            device.capabilities()
                         except (OSError, IOError) as e:
-                            if retry < 1:  # Don't sleep on last retry
-                                # Device might be busy from previous process - wait a bit
-                                time.sleep(0.05)
-                                continue
-                            # Last retry failed - this is a real error
                             if self.selected_device_path:
                                 print(f"[ERROR] Cannot access selected device '{device.name}' ({device.path}): {e}")
                                 print("[ERROR] This usually means you need root or input group membership")
@@ -245,52 +350,31 @@ class GlobalShortcuts:
                             print(f"[WARN] Cannot access device {device.name}: {e}")
                             print("[WARN]   This usually means you need root or input group membership")
                             device.close()
-                            break
+                            continue
                     
-                    if not grab_test_success:
-                        continue
-                else:
-                    # When grab_keys is false, still test if we can read from the device
-                    # This prevents adding inaccessible devices that will error in _event_loop()
-                    try:
-                        # Try to read capabilities as a basic accessibility test
-                        # This will fail if we don't have read permission
-                        device.capabilities()
-                    except (OSError, IOError) as e:
-                        if self.selected_device_path:
-                            print(f"[ERROR] Cannot access selected device '{device.name}' ({device.path}): {e}")
-                            print("[ERROR] This usually means you need root or input group membership")
-                            print("[ERROR]   Run: sudo usermod -aG input $USER (then log out and back in)")
-                            device.close()
-                            return
-                        print(f"[WARN] Cannot access device {device.name}: {e}")
-                        print("[WARN]   This usually means you need root or input group membership")
-                        device.close()
-                        continue
-                
-                # Device is usable - add it
-                self.devices.append(device)
-                self.device_fds[device.fd] = device
-                
-                # If we selected a specific device, we're done
+                    # Device is usable - add it
+                    self.devices.append(device)
+                    self.device_fds[device.fd] = device
+                    
+                    # If we selected a specific device, we're done
+                    if self.selected_device_path:
+                        break
+
+            except Exception as e:
+                print(f"[ERROR] Error discovering devices: {e}")
+                import traceback
+                traceback.print_exc()
+
+            if not self.devices:
                 if self.selected_device_path:
-                    break
-                        
-        except Exception as e:
-            print(f"[ERROR] Error discovering devices: {e}")
-            import traceback
-            traceback.print_exc()
-            
-        if not self.devices:
-            if self.selected_device_path:
-                # This shouldn't happen if we handled all cases above, but just in case
-                print(f"[ERROR] Selected device {self.selected_device_path} could not be initialized")
-            else:
-                print("[ERROR] No accessible keyboard devices found!")
-                print("[ERROR] Solutions:")
-                print("[ERROR]   1. Add yourself to 'input' group: sudo usermod -aG input $USER")
-                print("[ERROR]   2. Run with sudo: sudo hyprwhspr")
-                print("[ERROR]   3. Disable key grabbing in config (grab_keys: false)")
+                    # This shouldn't happen if we handled all cases above, but just in case
+                    print(f"[ERROR] Selected device {self.selected_device_path} could not be initialized")
+                else:
+                    print("[ERROR] No accessible devices found that can emit the configured shortcut!")
+                    print("[ERROR] Solutions:")
+                    print("[ERROR]   1. Add yourself to 'input' group: sudo usermod -aG input $USER")
+                    print("[ERROR]   2. Disable key grabbing in config (grab_keys: false)")
+                    print(f"[ERROR]   3. Check that your shortcut '{self.primary_key}' uses keys available on your keyboard")
 
     def _is_keyboard_device(self, device: InputDevice) -> bool:
         """Check if a device is a keyboard by testing for common keyboard keys"""
@@ -329,7 +413,7 @@ class GlobalShortcuts:
 
         # Must have keyboard keys to be considered a keyboard
         return has_keyboard_keys
-    
+
     def _parse_key_combination(self, key_string: str) -> Set[int]:
         """Parse a key combination string into a set of evdev key codes"""
         keys = set()
@@ -358,16 +442,26 @@ class GlobalShortcuts:
     
     def _string_to_keycode(self, key_string: str) -> Optional[int]:
         """Convert a human-friendly key string into an evdev keycode.
-        
-        Tries local aliases first, then falls back to evdev-style KEY_* names.
-        This hybrid approach supports both user-friendly names (ctrl, super, etc.)
-        and direct evdev key names (KEY_COMMA, KEY_1, etc.).
-        
+
+        For single letter keys, uses layout-aware mapping to find the correct
+        physical key for non-QWERTY layouts (Colemak, Dvorak, Workman, etc.).
+
+        For other keys, tries local aliases first, then falls back to evdev-style
+        KEY_* names. This hybrid approach supports both user-friendly names
+        (ctrl, super, etc.) and direct evdev key names (KEY_COMMA, KEY_1, etc.).
+
         Returns None if no matching keycode is found.
         """
         original = key_string
         key_string = key_string.lower().strip()
-        
+
+        # 0. For single letter keys, use layout-aware mapping
+        #    This handles non-QWERTY layouts like Colemak, Dvorak, Workman, etc.
+        if len(key_string) == 1 and key_string.isalpha():
+            layout_map = _get_layout_map()
+            if key_string in layout_map:
+                return layout_map[key_string]
+
         # 1. Try alias mapping first, easy names
         if key_string in KEY_ALIASES:
             key_name = KEY_ALIASES[key_string]
@@ -377,14 +471,14 @@ class GlobalShortcuts:
             key_name = key_string.upper()
             if not key_name.startswith('KEY_'):
                 key_name = f'KEY_{key_name}'
-        
+
         # 3. Look up the keycode in evdev's complete mapping
         code = ecodes.ecodes.get(key_name)
 
         if code is None:
             print(f"Warning: Unknown key string '{original}' (resolved to '{key_name}')")
             return None
-        
+
         return code
     
     def _keycode_to_name(self, keycode: int) -> str:
@@ -402,20 +496,25 @@ class GlobalShortcuts:
         """Main event loop for processing keyboard events"""
         try:
             while not self.stop_event.is_set():
-                if not self.devices:
+                # Create snapshot of devices with lock to prevent reading partial state during discovery
+                with self._device_lock:
+                    devices_snapshot = self.devices.copy()
+                    device_fds_snapshot = self.device_fds.copy()
+
+                if not devices_snapshot:
                     time.sleep(0.1)
                     continue
-                    
+
                 # Use select to wait for events from any device
-                device_fds = [dev.fd for dev in self.devices]
+                device_fds = [dev.fd for dev in devices_snapshot]
                 ready_fds, _, _ = select.select(device_fds, [], [], 0.1)
-                
+
                 # Don't log every event batch - too verbose
                 # Only log if we're debugging a specific issue
-                
+
                 for fd in ready_fds:
-                    if fd in self.device_fds:
-                        device = self.device_fds[fd]
+                    if fd in device_fds_snapshot:
+                        device = device_fds_snapshot[fd]
                         try:
                             # device.read() returns a generator, convert to list
                             events = list(device.read())
@@ -448,10 +547,14 @@ class GlobalShortcuts:
             except:
                 pass  # Device may already be ungrab or closed
             
-            if device in self.devices:
-                self.devices.remove(device)
-            if device.fd in self.device_fds:
-                del self.device_fds[device.fd]
+            # Protect device list modifications with lock to prevent race conditions
+            # with _discover_keyboards and _event_loop
+            with self._device_lock:
+                if device in self.devices:
+                    self.devices.remove(device)
+                if device.fd in self.device_fds:
+                    del self.device_fds[device.fd]
+            
             device.close()
         except:
             pass
@@ -629,40 +732,31 @@ class GlobalShortcuts:
 
     def _setup_key_grabbing(self) -> bool:
         """Set up UInput virtual keyboard and grab physical devices
-
+        
         Returns:
             True if at least one device was grabbed, False otherwise
         """
         try:
-            # Collect all key capabilities from devices we're about to grab
-            # This ensures the virtual keyboard can emit any key the physical keyboards can
-            all_keys = set()
-            for device in self.devices:
-                caps = device.capabilities()
-                if ecodes.EV_KEY in caps:
-                    all_keys.update(caps[ecodes.EV_KEY])
-
-            # Create a virtual keyboard with combined capabilities from all devices
-            self.uinput = UInput(
-                events={ecodes.EV_KEY: list(all_keys)},
-                name="hyprwhspr-virtual-keyboard"
-            )
+            # Create a virtual keyboard that can emit all key events
+            # This will re-emit keys that aren't part of our shortcut
+            self.uinput = UInput(name="hyprwhspr-virtual-keyboard")
 
             # Grab all keyboard devices to intercept their events
             # Use retry logic to handle cases where devices are temporarily busy (e.g., during service restart)
             # When a service restarts quickly, the kernel may not have released device grabs yet
             grabbed_count = 0
             for device in self.devices:
-                for retry in range(3):  # Increased retries for better recovery
+                for retry in range(10):  # Increased from 3 to 10 retries for better recovery
                     try:
                         device.grab()
                         grabbed_count += 1
                         break
                     except (OSError, IOError) as e:
-                        if retry < 2:  # Sleep on first two retries
-                            # Device might be busy from previous process - wait progressively longer
-                            # First retry: 0.1s, second retry: 0.2s
-                            time.sleep(0.1 * (retry + 1))
+                        if retry < 9:  # Retry all but last attempt
+                            # Device might be busy from previous process - use exponential backoff
+                            # Delays: 0.1s, 0.2s, 0.4s, 0.8s, 1.6s, then capped at 2.0s
+                            delay = min(0.1 * (2 ** retry), 2.0)
+                            time.sleep(delay)
                             continue
                         # Last retry failed - this is a real error
                         print(f"[ERROR] Could not grab {device.name} after {retry + 1} retries: {e}")
@@ -725,10 +819,17 @@ class GlobalShortcuts:
             self.stop_event.set()
 
             if self.listener_thread and self.listener_thread.is_alive():
-                self.listener_thread.join(timeout=1.0)
+                self.listener_thread.join(timeout=2.0)  # Increased from 1.0s to 2.0s
 
-            # Clean up key grabbing
-            self._cleanup_key_grabbing()
+                if self.listener_thread.is_alive():
+                    print("[WARN] Listener thread did not exit cleanly after 2 seconds, forcing cleanup")
+                    # Thread is stuck - cleanup will happen in event loop's finally block
+                    # Don't call cleanup here to avoid double-cleanup race
+
+            # Only cleanup if thread exited (or we're being called from outside thread context)
+            # This avoids race condition with event loop's finally block
+            if not self.listener_thread or not self.listener_thread.is_alive():
+                self._cleanup_key_grabbing()
 
             # Close all devices
             for device in self.devices[:]:  # Copy list to avoid modification during iteration
@@ -816,9 +917,18 @@ def normalize_key_name(key_name: str) -> str:
     return key_name.lower().strip().replace(' ', '')
 
 def _string_to_keycode_standalone(key_string: str) -> Optional[int]:
-    """Standalone version of string to keycode conversion for use outside GlobalShortcuts class"""
+    """Standalone version of string to keycode conversion for use outside GlobalShortcuts class.
+
+    Includes layout-aware mapping for non-QWERTY keyboard layouts.
+    """
     key_string = key_string.lower().strip()
-    
+
+    # 0. For single letter keys, use layout-aware mapping
+    if len(key_string) == 1 and key_string.isalpha():
+        layout_map = _get_layout_map()
+        if key_string in layout_map:
+            return layout_map[key_string]
+
     # 1. Try alias mapping first, easy names
     if key_string in KEY_ALIASES:
         key_name = KEY_ALIASES[key_string]
@@ -827,13 +937,13 @@ def _string_to_keycode_standalone(key_string: str) -> Optional[int]:
         key_name = key_string.upper()
         if not key_name.startswith('KEY_'):
             key_name = f'KEY_{key_name}'
-    
+
     # 3. Look up the keycode in evdev's complete mapping
     code = ecodes.ecodes.get(key_name)
-    
+
     if code is None:
         return None
-    
+
     return code
 
 def _parse_key_combination_standalone(key_string: str) -> Set[int]:
@@ -910,7 +1020,7 @@ def get_available_keyboards(shortcut: Optional[str] = None) -> List[Dict[str, st
                 continue
 
             available_keys = set(capabilities[ecodes.EV_KEY])
-            
+
             # If shortcut is provided, check that device can emit all required keys
             if target_keys and not target_keys.issubset(available_keys):
                 device.close()

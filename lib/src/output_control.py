@@ -124,43 +124,78 @@ def log_verbose(msg: str):
     OutputController.write(f"[VERBOSE] {msg}\n", VerbosityLevel.VERBOSE)
 
 
-def run_command(cmd: list, check: bool = True, capture_output: bool = False, 
+def run_command(cmd: list, check: bool = True, capture_output: bool = False,
                 env: Optional[dict] = None, verbose: Optional[bool] = None,
-                show_output_on_error: bool = True) -> subprocess.CompletedProcess:
+                show_output_on_error: bool = True, use_mise_free_env: bool = True,
+                timeout: Optional[float] = None) -> subprocess.CompletedProcess:
     """
     Run a shell command with output control.
-    
+
     Args:
         cmd: Command to run
         check: Raise exception on non-zero exit
         capture_output: Whether to capture output
-        env: Environment variables
+        env: Environment variables (if None and use_mise_free_env=True, auto-applies mise-free env when mise is active)
         verbose: Override verbosity for this command (None = use global)
         show_output_on_error: Show captured output if command fails
-    
+        use_mise_free_env: If True and env is None, automatically use mise-free environment when mise is active
+        timeout: Timeout in seconds (None = no timeout). Uses Python subprocess timeout, not external 'timeout' command.
+
     Returns:
         CompletedProcess result
     """
     controller = OutputController()
     verbosity = controller.get_verbosity()
     
+    # Auto-apply mise-free environment if needed
+    if use_mise_free_env and env is None:
+        # Lazy import to avoid circular dependencies
+        try:
+            from .backend_installer import _check_mise_active, _create_mise_free_environment
+        except ImportError:
+            try:
+                from backend_installer import _check_mise_active, _create_mise_free_environment
+            except ImportError:
+                # If import fails, just proceed without mise handling
+                _check_mise_active = None
+                _create_mise_free_environment = None
+        
+        if _check_mise_active and _create_mise_free_environment:
+            if _check_mise_active():
+                env = _create_mise_free_environment()
+    
     # Determine if we should show output
     if verbose is None:
         verbose = verbosity.value >= VerbosityLevel.VERBOSE.value
     
-    # If not verbose, always capture output (we'll show on error if needed)
-    if not verbose and not capture_output:
+    # Track if capture_output was explicitly requested
+    # If capture_output=True is explicitly set, always respect it (even in verbose mode)
+    explicit_capture = capture_output
+    
+    # If not verbose and capture_output not explicitly set, always capture output (we'll show on error if needed)
+    if not verbose and not explicit_capture:
         capture_output = True
     
     try:
-        if verbose:
+        # If capture_output was explicitly requested, always use it regardless of verbosity
+        if explicit_capture:
+            result = subprocess.run(
+                cmd,
+                check=check,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=timeout
+            )
+        elif verbose:
             # Show real-time output
             result = subprocess.run(
                 cmd,
                 check=check,
                 capture_output=False,
                 text=True,
-                env=env
+                env=env,
+                timeout=timeout
             )
         else:
             # Capture output, show on error if requested
@@ -169,17 +204,21 @@ def run_command(cmd: list, check: bool = True, capture_output: bool = False,
                 check=check,
                 capture_output=True,
                 text=True,
-                env=env
+                env=env,
+                timeout=timeout
             )
-            
+
             # Show output on error if requested
             if result.returncode != 0 and show_output_on_error:
                 if result.stdout:
                     log_error(f"Command stdout:\n{result.stdout}")
                 if result.stderr:
                     log_error(f"Command stderr:\n{result.stderr}")
-        
+
         return result
+    except subprocess.TimeoutExpired:
+        log_error(f"Command timed out after {timeout}s: {' '.join(cmd)}")
+        raise
     except subprocess.CalledProcessError as e:
         log_error(f"Command failed: {' '.join(cmd)}")
         if hasattr(e, 'stdout') and e.stdout and show_output_on_error:

@@ -19,12 +19,15 @@ except ImportError:
 
 from cli_commands import (
     setup_command,
+    omarchy_command,
     config_command,
     waybar_command,
+    mic_osd_command,
     systemd_command,
     model_command,
     status_command,
     validate_command,
+    test_command,
     backend_repair_command,
     backend_reset_command,
     state_show_command,
@@ -56,8 +59,22 @@ def main():
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
     # setup command
-    subparsers.add_parser('setup', help='Full initial setup')
-    
+    setup_parser = subparsers.add_parser('setup', help='Full initial setup')
+    setup_subparsers = setup_parser.add_subparsers(dest='setup_action', help='Setup actions')
+    auto_parser = setup_subparsers.add_parser('auto', help='Automated setup')
+    auto_parser.add_argument('--backend', choices=['nvidia', 'vulkan', 'cpu', 'onnx-asr'],
+                             help='Backend to install (default: auto-detect GPU)')
+    auto_parser.add_argument('--model', help='Model to download (default: base for whisper, auto for onnx-asr)')
+    auto_parser.add_argument('--no-waybar', action='store_true', help='Skip waybar integration')
+    auto_parser.add_argument('--no-mic-osd', action='store_true', help='Disable mic-osd visualization')
+    auto_parser.add_argument('--no-systemd', action='store_true', help='Skip systemd service setup')
+    auto_parser.add_argument('--hypr-bindings', action='store_true', help='Enable Hyprland compositor bindings')
+
+    # install command
+    install_parser = subparsers.add_parser('install', help='Installation management')
+    install_subparsers = install_parser.add_subparsers(dest='install_action', help='Install actions')
+    install_subparsers.add_parser('auto', help=argparse.SUPPRESS)  # Hidden for backwards compatibility, use 'setup auto' instead
+
     # config command
     config_parser = subparsers.add_parser('config', help='Configuration management')
     config_subparsers = config_parser.add_subparsers(dest='config_action', help='Config actions')
@@ -72,6 +89,13 @@ def main():
     waybar_subparsers.add_parser('remove', help='Remove module from waybar config')
     waybar_subparsers.add_parser('status', help='Check if waybar is configured')
     
+    # mic-osd command
+    mic_osd_parser = subparsers.add_parser('mic-osd', help='Microphone visualization overlay')
+    mic_osd_subparsers = mic_osd_parser.add_subparsers(dest='mic_osd_action', help='Mic-OSD actions')
+    mic_osd_subparsers.add_parser('enable', help='Enable visualization during recording')
+    mic_osd_subparsers.add_parser('disable', help='Disable visualization')
+    mic_osd_subparsers.add_parser('status', help='Check mic-osd status')
+    
     # systemd command
     systemd_parser = subparsers.add_parser('systemd', help='Systemd service management')
     systemd_subparsers = systemd_parser.add_subparsers(dest='systemd_action', help='Systemd actions')
@@ -85,7 +109,7 @@ def main():
     model_parser = subparsers.add_parser('model', help='Model management')
     model_subparsers = model_parser.add_subparsers(dest='model_action', help='Model actions')
     model_download_parser = model_subparsers.add_parser('download', help='Download model')
-    model_download_parser.add_argument('name', nargs='?', default='base.en', help='Model name (default: base.en)')
+    model_download_parser.add_argument('name', nargs='?', default='base', help='Model name (default: base)')
     model_subparsers.add_parser('list', help='List available models')
     model_subparsers.add_parser('status', help='Check installed models')
     
@@ -94,6 +118,13 @@ def main():
     
     # validate command
     subparsers.add_parser('validate', help='Validate installation')
+
+    # test command
+    test_parser = subparsers.add_parser('test', help='Test microphone and backend connectivity')
+    test_parser.add_argument('--live', action='store_true',
+                            help='Record live audio instead of using test.wav')
+    test_parser.add_argument('--mic-only', action='store_true',
+                            help='Only test microphone, skip transcription')
     
     # backend command
     backend_parser = subparsers.add_parser('backend', help='Backend management')
@@ -147,7 +178,21 @@ def main():
     # Route to appropriate command handler
     try:
         if args.command == 'setup':
-            setup_command()
+            if hasattr(args, 'setup_action') and args.setup_action == 'auto':
+                if not omarchy_command(args):
+                    sys.exit(1)
+            elif hasattr(args, 'setup_action') and args.setup_action:
+                setup_parser.print_help()
+                sys.exit(1)
+            else:
+                setup_command()
+        elif args.command == 'install':
+            if not args.install_action:
+                install_parser.print_help()
+                sys.exit(1)
+            if args.install_action == 'auto':
+                if not omarchy_command(args):
+                    sys.exit(1)
         elif args.command == 'config':
             if not args.config_action:
                 config_parser.print_help()
@@ -158,6 +203,11 @@ def main():
                 waybar_parser.print_help()
                 sys.exit(1)
             waybar_command(args.waybar_action)
+        elif args.command == 'mic-osd':
+            if not args.mic_osd_action:
+                mic_osd_parser.print_help()
+                sys.exit(1)
+            mic_osd_command(args.mic_osd_action)
         elif args.command == 'systemd':
             if not args.systemd_action:
                 systemd_parser.print_help()
@@ -167,12 +217,17 @@ def main():
             if not args.model_action:
                 model_parser.print_help()
                 sys.exit(1)
-            model_name = getattr(args, 'name', 'base.en')
+            model_name = getattr(args, 'name', 'base')
             model_command(args.model_action, model_name)
         elif args.command == 'status':
             status_command()
         elif args.command == 'validate':
             validate_command()
+        elif args.command == 'test':
+            test_command(
+                live=getattr(args, 'live', False),
+                mic_only=getattr(args, 'mic_only', False)
+            )
         elif args.command == 'backend':
             if not args.backend_action:
                 backend_parser.print_help()

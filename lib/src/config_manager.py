@@ -7,6 +7,11 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
+try:
+    from .paths import CONFIG_DIR, CONFIG_FILE, TEMP_DIR
+except ImportError:
+    from paths import CONFIG_DIR, CONFIG_FILE, TEMP_DIR
+
 
 class ConfigManager:
     """Manages application configuration and settings"""
@@ -15,7 +20,16 @@ class ConfigManager:
         # Default configuration values - minimal set for hyprwhspr
         self.default_config = {
             'primary_shortcut': 'SUPER+ALT+D',
+            'secondary_shortcut': None,  # Optional secondary hotkey for language-specific recording (e.g., "SUPER+ALT+I")
+            'secondary_language': None,  # Language code for secondary shortcut (e.g., "it", "en", "fr", etc.)
             'recording_mode': 'toggle',  # 'toggle' | 'push_to_talk' | 'auto' (hybrid tap/hold)
+            'grab_keys': False,     # Exclusive keyboard grab (false = safer, true = suppress shortcut from other apps)
+            'use_hypr_bindings': False,  # Use Hyprland compositor bindings instead of evdev (disables GlobalShortcuts)
+            # Audio device persistence (for reliable device matching across reboots)
+            'audio_device_id': None,        # PortAudio device index (can change on reboot)
+            'audio_device_name': None,      # Human-readable device name (more stable)
+            'audio_device_vendor_id': None, # USB vendor ID (most stable, from udev)
+            'audio_device_model_id': None,  # USB model ID (most stable, from udev)
             'model': 'base',
             'threads': 4,           # Thread count for whisper processing
             'language': None,       # Language code for transcription (None = auto-detect, or 'en', 'nl', 'fr', etc.)
@@ -29,7 +43,7 @@ class ConfigManager:
             # Back-compat for older configs (used only if paste_mode is absent):
             'shift_paste': True,  # true = Ctrl+Shift+V, false = Ctrl+V
             # Transcription backend settings
-            'transcription_backend': 'pywhispercpp',  # "pywhispercpp" (or "cpu"/"nvidia"/"amd") or "rest-api"
+            'transcription_backend': 'pywhispercpp',  # "pywhispercpp" (or "cpu"/"nvidia"/"vulkan"/"amd") or "rest-api"
             'rest_endpoint_url': None,         # Full HTTP or HTTPS URL for remote transcription
             'rest_api_provider': None,          # Provider identifier for credential lookup (e.g., 'openai', 'groq', 'custom')
             'rest_api_key': None,              # DEPRECATED: Optional API key for authentication (kept for backward compatibility)
@@ -43,12 +57,28 @@ class ConfigManager:
             'websocket_url': None,             # Optional: explicit WebSocket URL (auto-derived if None)
             'realtime_timeout': 30,            # Completion timeout (seconds)
             'realtime_buffer_max_seconds': 5,  # Max buffer before dropping chunks
-            'realtime_mode': 'transcribe'      # 'transcribe' (speech-to-text) or 'converse' (voice-to-AI)
+            'realtime_mode': 'transcribe',      # 'transcribe' (speech-to-text) or 'converse' (voice-to-AI)
+            # ONNX-ASR backend settings (CPU-optimized)
+            'onnx_asr_model': 'nemo-parakeet-tdt-0.6b-v3',  # Best balance of speed and quality for CPU (includes punctuation)
+            'onnx_asr_quantization': 'int8',             # INT8 quantization for CPU performance (or None for fp32)
+            'onnx_asr_use_vad': True,                    # Use VAD for long recordings (>30s)
+            # Visual feedback settings
+            'mic_osd_enabled': True,             # Show microphone visualization overlay during recording
+            'mute_detection': True,              # Enable mute detection to cancel recording when mic is muted
+            # Audio ducking settings
+            'audio_ducking': False,              # Reduce system volume during recording
+            'audio_ducking_percent': 50,         # How much to reduce BY (50 = reduce to 50% of original)
+            # Post-paste behavior
+            'auto_submit': False,                # Send Enter key after pasting text (for chat/search inputs)
+            # Long-form recording mode settings
+            'long_form_submit_shortcut': None,   # Shortcut to submit long-form recording (e.g., "Super+Return")
+            'long_form_temp_limit_mb': 500,      # Max temp storage in MB for long-form segments
+            'long_form_auto_save_interval': 300  # Auto-save interval in seconds (default: 5 minutes)
         }
         
         # Set up config directory and file path
-        self.config_dir = Path.home() / '.config' / 'hyprwhspr'
-        self.config_file = self.config_dir / 'config.json'
+        self.config_dir = CONFIG_DIR
+        self.config_file = CONFIG_FILE
         
         # Current configuration (starts with defaults)
         self.config = self.default_config.copy()
@@ -88,7 +118,13 @@ class ConfigManager:
                     # Remove old push_to_talk key from loaded config
                     del loaded_config['push_to_talk']
                     migration_occurred = True
-                
+
+                # Migrate old audio_device config key to audio_device_id
+                if 'audio_device' in loaded_config and 'audio_device_id' not in loaded_config:
+                    loaded_config['audio_device_id'] = loaded_config['audio_device']
+                    del loaded_config['audio_device']
+                    migration_occurred = True
+
                 # Merge loaded config with defaults (preserving any new default keys)
                 self.config.update(loaded_config)
                 
@@ -141,9 +177,8 @@ class ConfigManager:
     def get_temp_directory(self) -> Path:
         """Get the temporary directory for audio files"""
         # Use user-writable temp directory instead of system installation directory
-        temp_dir = Path.home() / '.local' / 'share' / 'hyprwhspr' / 'temp'
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        return temp_dir
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        return TEMP_DIR
     
     def get_word_overrides(self) -> Dict[str, str]:
         """Get the word overrides dictionary"""

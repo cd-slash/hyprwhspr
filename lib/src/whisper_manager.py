@@ -8,6 +8,7 @@ import shutil
 import sys
 import threading
 import time
+import types
 import wave
 import re
 import io
@@ -16,22 +17,12 @@ from io import BytesIO
 from typing import Optional, Callable
 
 try:
-    import numpy as np
-except (ImportError, ModuleNotFoundError) as e:
-    print("ERROR: python-numpy is not available in this Python environment.", file=sys.stderr)
-    print(f"ImportError: {e}", file=sys.stderr)
-    print("\nThis is a required dependency. Please install it:", file=sys.stderr)
-    print("  pacman -S python-numpy    # system-wide on Arch", file=sys.stderr)
-    sys.exit(1)
+    from .dependencies import require_package
+except ImportError:
+    from dependencies import require_package
 
-try:
-    import requests
-except (ImportError, ModuleNotFoundError) as e:
-    print("ERROR: python-requests is not available in this Python environment.", file=sys.stderr)
-    print(f"ImportError: {e}", file=sys.stderr)
-    print("\nThis is a required dependency. Please install it:", file=sys.stderr)
-    print("  pacman -S python-requests    # system-wide on Arch", file=sys.stderr)
-    sys.exit(1)
+np = require_package('numpy')
+requests = require_package('requests')
 
 try:
     from .config_manager import ConfigManager
@@ -41,6 +32,11 @@ except ImportError:
     from config_manager import ConfigManager
     from credential_manager import get_credential
     from provider_registry import get_provider
+
+try:
+    from .backend_utils import normalize_backend
+except ImportError:
+    from backend_utils import normalize_backend
 
 
 class WhisperManager:
@@ -63,6 +59,9 @@ class WhisperManager:
         self._realtime_client = None
         self._realtime_streaming_callback = None
 
+        # ONNX-ASR model (CPU-optimized)
+        self._onnx_asr_model = None
+
         # Thread safety for model operations
         self._model_lock = threading.Lock()
 
@@ -79,12 +78,79 @@ class WhisperManager:
 
             # Check which backend is configured
             backend = self.config.get_setting('transcription_backend', 'pywhispercpp')
-            
-            # Backward compatibility: map old values
-            if backend == 'local':
-                backend = 'pywhispercpp'
-            elif backend == 'remote':
-                backend = 'rest-api'
+            backend = normalize_backend(backend)  # Backward compatibility
+
+            # Configure ONNX-ASR backend (CPU or GPU-optimized)
+            if backend == 'onnx-asr':
+                try:
+                    import onnx_asr
+                except ImportError:
+                    print('ERROR: onnx-asr not installed. Run: hyprwhspr setup')
+                    print('ERROR: Select option [1] ONNX Parakeet to install')
+                    return False
+
+                # Suppress ONNX Runtime verbose error logging
+                # Errors about missing CUDA libraries are expected and will fall back to CPU
+                import os
+                import logging
+                import sys
+                import contextlib
+                from io import StringIO
+                
+                # Set ONNX Runtime log level to suppress warnings/errors
+                os.environ['ORT_LOGGING_LEVEL'] = '4'  # 4 = FATAL (suppress ERROR/WARNING/INFO)
+                
+                # Detect GPU availability at runtime (but don't claim it if libraries aren't available)
+                use_gpu = False
+                try:
+                    import onnxruntime
+                    # Suppress ONNX Runtime Python logging
+                    logging.getLogger('onnxruntime').setLevel(logging.CRITICAL)
+                    
+                    # Check if providers are listed (but they may not actually work)
+                    available_providers = onnxruntime.get_available_providers()
+                    if 'CUDAExecutionProvider' in available_providers or 'TensorrtExecutionProvider' in available_providers:
+                        # Note: We'll let onnx-asr try to use GPU, but it will fall back to CPU
+                        # if libraries aren't available. We won't claim GPU support upfront.
+                        use_gpu = True
+                except Exception:
+                    pass
+
+                model_name = self.config.get_setting('onnx_asr_model', 'nemo-parakeet-tdt-0.6b-v3')
+                quantization = self.config.get_setting('onnx_asr_quantization', 'int8')
+                use_vad = self.config.get_setting('onnx_asr_use_vad', True)
+
+                print(f'[BACKEND] Loading onnx-asr model: {model_name} ({"GPU" if use_gpu else "CPU"})', flush=True)
+
+                try:
+                    # Load model with optional quantization
+                    # onnx-asr automatically uses GPU providers if available
+                    # Suppress stderr during model loading to avoid CUDA library error spam
+                    # These errors are harmless - ONNX Runtime will fall back to CPU automatically
+                    with contextlib.redirect_stderr(StringIO()):
+                        if quantization:
+                            self._onnx_asr_model = onnx_asr.load_model(model_name, quantization=quantization)
+                        else:
+                            self._onnx_asr_model = onnx_asr.load_model(model_name)
+
+                    # Add VAD for long audio handling (>30s)
+                    if use_vad:
+                        print('[BACKEND] Loading Silero VAD for long audio support', flush=True)
+                        vad = onnx_asr.load_vad('silero')
+                        self._onnx_asr_model = self._onnx_asr_model.with_vad(vad)
+
+                    print(f'[BACKEND] onnx-asr ready (model={model_name}, quantization={quantization}, vad={use_vad}, gpu={use_gpu})', flush=True)
+
+                except Exception as e:
+                    print(f'ERROR: Failed to load onnx-asr model: {e}', flush=True)
+                    import traceback
+                    traceback.print_exc()
+                    return False
+
+                # onnx-asr doesn't use current_model in the same way
+                self.current_model = None
+                self.ready = True
+                return True
 
             # Configure Realtime WebSocket backend
             if backend == 'realtime-ws':
@@ -142,6 +208,9 @@ class WhisperManager:
                 
                 instructions = ' '.join(instructions_parts) if instructions_parts else None
                 
+                # Set language in realtime client (for session.update)
+                self._realtime_client.language = language
+                
                 # Set buffer max seconds
                 buffer_max = self.config.get_setting('realtime_buffer_max_seconds', 5)
                 self._realtime_client.set_max_buffer_seconds(buffer_max)
@@ -149,6 +218,11 @@ class WhisperManager:
                 # Connect
                 if not self._realtime_client.connect(websocket_url, api_key, model_id, instructions):
                     print('ERROR: Failed to connect to Realtime WebSocket')
+                    # Clean up failed client
+                    try:
+                        self._realtime_client.close()
+                    except Exception:
+                        pass
                     self._realtime_client = None
                     return False
                 
@@ -386,7 +460,20 @@ class WhisperManager:
                         return "CUDA (NVIDIA)"
                 except (subprocess.TimeoutExpired, Exception):
                     pass
-        elif backend_config == 'amd':
+        elif backend_config in ['amd', 'vulkan']:
+            # Check for Vulkan first (new default for AMD/Intel)
+            if shutil.which('vulkaninfo'):
+                try:
+                    result = subprocess.run(['vulkaninfo', '--summary'],
+                                           capture_output=True,
+                                           timeout=2)
+                    if result and result.returncode == 0:
+                        output = result.stdout.lower() if result.stdout else ''
+                        if 'llvmpipe' not in output and 'software' not in output:
+                            return "Vulkan (AMD/Intel)"
+                except (subprocess.TimeoutExpired, Exception):
+                    pass
+            # Fallback: check for ROCm (backward compatibility)
             if shutil.which('rocm-smi') or os.path.exists('/opt/rocm'):
                 try:
                     result = subprocess.run(['rocm-smi', '--showproductname'],
@@ -583,13 +670,14 @@ class WhisperManager:
             # Converse mode uses model parameter
             return f"{base_url}?model={model_id}"
 
-    def _transcribe_rest(self, audio_data: np.ndarray, sample_rate: int = 16000) -> str:
+    def _transcribe_rest(self, audio_data: np.ndarray, sample_rate: int = 16000, language_override: Optional[str] = None) -> str:
         """
         Transcribe audio using remote REST API endpoint
 
         Args:
             audio_data: NumPy array of audio samples (float32)
             sample_rate: Sample rate of the audio data
+            language_override: Optional language code to override config language
 
         Returns:
             Transcribed text string
@@ -703,7 +791,8 @@ class WhisperManager:
 
             # Add language parameter if configured
             data = extra_body.copy()
-            language = self.config.get_setting('language', None)
+            # Use language_override if provided, otherwise get from config
+            language = language_override if language_override is not None else self.config.get_setting('language', None)
             if language and 'language' not in data:
                 data['language'] = language
 
@@ -759,7 +848,7 @@ class WhisperManager:
             print(f'ERROR: REST transcription failed: {e}')
             return ''
 
-    def _transcribe_realtime(self, _audio_data: np.ndarray, _sample_rate: int = 16000) -> str:
+    def _transcribe_realtime(self, _audio_data: np.ndarray, _sample_rate: int = 16000, language_override: Optional[str] = None) -> str:
         """
         Transcribe audio using Realtime WebSocket backend.
         
@@ -769,6 +858,7 @@ class WhisperManager:
         Args:
             audio_data: NumPy array of audio samples (float32)
             sample_rate: Sample rate of the audio data (should be 16000)
+            language_override: Optional language code to override config language
         
         Returns:
             Transcribed text string
@@ -782,6 +872,10 @@ class WhisperManager:
             return ""
         
         try:
+            # Update language if override provided
+            if language_override is not None:
+                self._realtime_client.update_language(language_override)
+            
             # Get timeout from config
             timeout = self.config.get_setting('realtime_timeout', 30)
             
@@ -794,6 +888,68 @@ class WhisperManager:
             print(f'[REALTIME] Transcription failed: {e}')
             return ""
 
+    def _transcribe_onnx_asr(self, audio_data: np.ndarray, sample_rate: int = 16000) -> str:
+        """
+        Transcribe audio using onnx-asr backend (CPU-optimized).
+
+        Args:
+            audio_data: NumPy array of audio samples (float32)
+            sample_rate: Sample rate of the audio data (should be 16000)
+
+        Returns:
+            Transcribed text string
+        """
+        if not self._onnx_asr_model:
+            print('[ONNX-ASR] Model not loaded')
+            return ""
+
+        try:
+            audio_duration = len(audio_data) / sample_rate
+            print(f'[ONNX-ASR] Transcribing {audio_duration:.2f}s of audio', flush=True)
+
+            # onnx-asr accepts numpy arrays directly (float32)
+            # It handles resampling internally if needed
+            start_time = time.time()
+            result = self._onnx_asr_model.recognize(audio_data)
+            elapsed = time.time() - start_time
+
+            # When VAD is enabled, recognize() returns a generator of segments
+            if isinstance(result, types.GeneratorType):
+                # Collect all segments and combine their text
+                segments = list(result)
+                if not segments:
+                    transcription = ""
+                else:
+                    # Extract text from each segment
+                    segment_texts = []
+                    for seg in segments:
+                        if hasattr(seg, 'text'):
+                            segment_texts.append(seg.text)
+                        elif isinstance(seg, str):
+                            segment_texts.append(seg)
+                        else:
+                            # Fallback: try to get text representation
+                            segment_texts.append(str(seg))
+                    transcription = ' '.join(segment_texts)
+            else:
+                # No VAD - direct result (string or object with .text attribute)
+                if hasattr(result, 'text'):
+                    transcription = result.text
+                elif isinstance(result, str):
+                    transcription = result
+                else:
+                    transcription = str(result)
+
+            print(f'[ONNX-ASR] Transcription completed in {elapsed:.2f}s', flush=True)
+
+            return transcription.strip()
+
+        except Exception as e:
+            print(f'[ONNX-ASR] Transcription failed: {e}', flush=True)
+            import traceback
+            traceback.print_exc()
+            return ""
+
     def get_realtime_streaming_callback(self) -> Optional[Callable]:
         """
         Get the streaming callback for realtime-ws backend.
@@ -802,10 +958,7 @@ class WhisperManager:
             Callback function if realtime-ws backend is active, None otherwise
         """
         backend = self.config.get_setting('transcription_backend', 'pywhispercpp')
-        if backend == 'local':
-            backend = 'pywhispercpp'
-        elif backend == 'remote':
-            backend = 'rest-api'
+        backend = normalize_backend(backend)
         
         if backend == 'realtime-ws' and self._realtime_client:
             # Clear server buffer before starting new recording
@@ -817,13 +970,14 @@ class WhisperManager:
         """Check if whisper is ready for transcription"""
         return self.ready
 
-    def transcribe_audio(self, audio_data: np.ndarray, sample_rate: int = 16000) -> str:
+    def transcribe_audio(self, audio_data: np.ndarray, sample_rate: int = 16000, language_override: Optional[str] = None) -> str:
         """
         Transcribe audio data using whisper
 
         Args:
             audio_data: NumPy array of audio samples (float32)
             sample_rate: Sample rate of the audio data
+            language_override: Optional language code to override config language (e.g., 'it', 'en', 'fr')
 
         Returns:
             Transcribed text string
@@ -908,32 +1062,38 @@ class WhisperManager:
             # Debug: ensure we're not accidentally using pywhispercpp
             if self._pywhisper_model is not None:
                 print(f"[WARN] REST API backend selected but pywhispercpp model is loaded - this should not happen", flush=True)
-            return self._transcribe_rest(audio_data, sample_rate)
+            return self._transcribe_rest(audio_data, sample_rate, language_override=language_override)
 
         if backend == 'realtime-ws':
             # Use Realtime WebSocket transcription
             # Note: Audio was already streamed via callback during capture
             # This just commits and waits for the result
-            return self._transcribe_realtime(audio_data, sample_rate)
+            return self._transcribe_realtime(audio_data, sample_rate, language_override=language_override)
 
-        # Check if model needs reinitialization (suspend/resume detection)
-        current_time = time.monotonic()
-        time_since_last_use = current_time - self._last_use_time
-        
-        # If model hasn't been used in 5+ minutes, likely suspend/resume occurred
-        # Reinitialize to refresh CUDA context before using stale model
-        if time_since_last_use > 300 and self._last_use_time > 0:
-            print("[MODEL] Long idle period detected - reinitializing model (suspend/resume likely)", flush=True)
-            if not self._reinitialize_model():
-                print("[MODEL] Reinitialization failed, transcription may fail", flush=True)
-                return ""
+        if backend == 'onnx-asr':
+            # Use ONNX-ASR transcription (CPU-optimized)
+            return self._transcribe_onnx_asr(audio_data, sample_rate)
 
         # Use model lock to prevent concurrent transcription calls
         # This prevents crashes from concurrent access to the whisper model
         with self._model_lock:
+            # Check if model needs reinitialization (suspend/resume detection)
+            # This check is inside the lock to prevent race conditions where
+            # multiple threads detect idle period and try to reinitialize simultaneously
+            current_time = time.monotonic()
+            time_since_last_use = current_time - self._last_use_time
+
+            # If model hasn't been used in 5+ minutes, likely suspend/resume occurred
+            # Reinitialize to refresh CUDA context before using stale model
+            if time_since_last_use > 300 and self._last_use_time > 0:
+                print("[MODEL] Long idle period detected - reinitializing model (suspend/resume likely)", flush=True)
+                if not self._reinitialize_model():
+                    print("[MODEL] Reinitialization failed, transcription may fail", flush=True)
+                    return ""
+
             try:
-                # Get language setting from config (None = auto-detect)
-                language = self.config.get_setting('language', None)
+                # Use language_override if provided, otherwise get from config (None = auto-detect)
+                language = language_override if language_override is not None else self.config.get_setting('language', None)
                 
                 # Intercept progress logs and enhance them
                 with self._intercept_progress_logs():
@@ -998,13 +1158,11 @@ class WhisperManager:
             return self.initialize()
         
         backend = self.config.get_setting('transcription_backend', 'pywhispercpp')
-        if backend == 'local':
-            backend = 'pywhispercpp'
-        elif backend == 'remote':
-            backend = 'rest-api'
-        
-        # Only reinitialize for pywhispercpp backend
-        if backend != 'pywhispercpp':
+        backend = normalize_backend(backend)
+
+        # Only reinitialize for pywhispercpp and its variants (cpu, nvidia, vulkan/amd)
+        pywhispercpp_variants = ['pywhispercpp', 'cpu', 'nvidia', 'amd', 'vulkan']
+        if backend not in pywhispercpp_variants:
             return True
         
         print("[MODEL] Reinitializing whisper model (suspend/resume detected)", flush=True)

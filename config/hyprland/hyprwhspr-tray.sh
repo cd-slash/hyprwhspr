@@ -126,6 +126,21 @@ PY
         return 0
     fi
 
+    # Check onnx-asr availability (lightweight, non-blocking)
+    if [[ "$backend" == "onnx-asr" ]]; then
+        local venv_python="${XDG_DATA_HOME:-$HOME/.local/share}/hyprwhspr/venv/bin/python"
+        # Fast timeout check - verify onnx_asr is importable
+        # Uses absolute path to venv Python (resilient to MISE/PATH issues)
+        if [[ -f "$venv_python" ]]; then
+            # Only return success if import actually succeeds
+            if timeout 0.5s "$venv_python" -c 'import onnx_asr' >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        # If venv doesn't exist or import fails, return failure
+        return 1
+    fi
+
     # Only read model setting for pywhispercpp backends
     local model_path
     model_path=$(python - <<'PY' "$cfg" 2>/dev/null
@@ -295,35 +310,215 @@ show_notification() {
     local title="$1"
     local message="$2"
     local urgency="${3:-normal}"
-    
+
     if command -v notify-send &> /dev/null; then
         notify-send -i "$ICON_PATH" "$title" "$message" -u "$urgency"
     fi
 }
 
+# Function to check and show recovery result notification
+check_recovery_result() {
+    local result_file="$HOME/.config/hyprwhspr/recovery_result"
+    local notification_lock_dir="$HOME/.config/hyprwhspr/.recovery_notification_lock"
+    local notification_lock_file="${notification_lock_dir}/lock"
+
+    if [[ ! -f "$result_file" ]]; then
+        return 0
+    fi
+
+    local result
+    result=$(cat "$result_file" 2>/dev/null)
+
+    if [[ -z "$result" ]]; then
+        return 0
+    fi
+
+    # Parse result format: status:reason:timestamp
+    local status="${result%%:*}"
+    local rest="${result#*:}"
+    local reason="${rest%%:*}"
+    local timestamp="${rest#*:}"
+
+    # Check if result is fresh (within last 10 seconds)
+    local current_time=$(date +%s)
+    local result_age=$((current_time - timestamp))
+
+    # Only process recent results
+    if [[ $result_age -gt 10 ]]; then
+        # Stale result, remove it
+        rm -f "$result_file" 2>/dev/null
+        # Clean up stale lock directory
+        [[ -d "$notification_lock_dir" ]] && rmdir "$notification_lock_dir" 2>/dev/null
+        return 0
+    fi
+
+    # Atomic check-and-set using directory creation
+    # Directory creation is atomic - only one process can succeed
+    local result_key="${status}:${reason}"
+    local should_show=false
+    
+    # Try to create lock directory atomically
+    if mkdir "$notification_lock_dir" 2>/dev/null; then
+        # We successfully created the lock - we're the first to process this
+        should_show=true
+        # Write metadata to lock file inside the directory
+        echo "${current_time}:${status}:${reason}" > "$notification_lock_file" 2>/dev/null
+    else
+        # Lock directory already exists - check if it's for the same result
+        if [[ -f "$notification_lock_file" ]]; then
+            local lock_content
+            lock_content=$(cat "$notification_lock_file" 2>/dev/null)
+            if [[ -n "$lock_content" ]]; then
+                # Parse lock file format: timestamp:status:reason
+                local lock_timestamp="${lock_content%%:*}"
+                local lock_rest="${lock_content#*:}"
+                local lock_status="${lock_rest%%:*}"
+                local lock_reason="${lock_rest#*:}"
+                local lock_key="${lock_status}:${lock_reason}"
+                
+                if [[ -n "$lock_timestamp" ]]; then
+                    local lock_age=$((current_time - lock_timestamp))
+                    # If same result and within 60 seconds, suppress notification
+                    if [[ "$lock_key" == "$result_key" && $lock_age -lt 60 ]]; then
+                        should_show=false
+                    else
+                        # Different result or stale lock (>60s) - clean up and allow notification
+                        rm -rf "$notification_lock_dir" 2>/dev/null
+                        # Retry creating lock (but only once to avoid infinite loop)
+                        if mkdir "$notification_lock_dir" 2>/dev/null; then
+                            should_show=true
+                            echo "${current_time}:${status}:${reason}" > "$notification_lock_file" 2>/dev/null
+                        fi
+                    fi
+                else
+                    # Invalid lock timestamp - clean up stale lock
+                    rm -rf "$notification_lock_dir" 2>/dev/null
+                    if mkdir "$notification_lock_dir" 2>/dev/null; then
+                        should_show=true
+                        echo "${current_time}:${status}:${reason}" > "$notification_lock_file" 2>/dev/null
+                    fi
+                fi
+            else
+                # Lock file missing but directory exists - clean up stale lock
+                rmdir "$notification_lock_dir" 2>/dev/null
+                # Retry once
+                if mkdir "$notification_lock_dir" 2>/dev/null; then
+                    should_show=true
+                    echo "${current_time}:${status}:${reason}" > "$notification_lock_file" 2>/dev/null
+                fi
+            fi
+        else
+            # Directory exists but no lock file - clean up and retry
+            rmdir "$notification_lock_dir" 2>/dev/null
+            if mkdir "$notification_lock_dir" 2>/dev/null; then
+                should_show=true
+                echo "${current_time}:${status}:${reason}" > "$notification_lock_file" 2>/dev/null
+            fi
+        fi
+    fi
+
+    if [[ "$should_show" == "true" ]]; then
+        # Show notification based on status
+        if [[ "$status" == "success" ]]; then
+            case "$reason" in
+                hotplug)
+                    # Auto-restart service after hotplug to ensure clean state
+                    # Only restart if not currently recording (avoid interrupting user)
+                    sleep 1.5  # Let device enumeration fully settle
+                    if ! is_hyprwhspr_recording; then
+                        echo "Auto-restarting service after mic reconnection..." >&2
+                        show_notification "hyprwhspr" "Microphone reconnected - restarting service..." "normal"
+                        systemctl --user restart hyprwhspr.service
+                        # Give service a moment to restart before showing ready notification
+                        sleep 0.5
+                        show_notification "hyprwhspr" "Ready to record" "low"
+                    else
+                        echo "Skipping auto-restart (recording in progress)" >&2
+                        show_notification "hyprwhspr" "Microphone reconnected successfully" "normal"
+                    fi
+                    ;;
+                mic_unavailable|mic_no_audio)
+                    show_notification "hyprwhspr" "Microphone recovered successfully" "normal"
+                    ;;
+                *)
+                    show_notification "hyprwhspr" "Recovery successful" "normal"
+                    ;;
+            esac
+
+            # Clear any cached error states after successful recovery
+            # Give device enumeration a moment to settle before next status check
+            sleep 0.5
+        elif [[ "$status" == "failed" ]]; then
+            case "$reason" in
+                hotplug)
+                    show_notification "hyprwhspr" "Microphone detected but recovery failed - please wait or restart service" "critical"
+                    ;;
+                mic_unavailable|mic_no_audio)
+                    show_notification "hyprwhspr" "Recovery failed - please replug microphone" "critical"
+                    ;;
+                *)
+                    show_notification "hyprwhspr" "Recovery failed - please check microphone connection" "critical"
+                    ;;
+            esac
+        fi
+    fi
+
+    # Keep result file for short grace period; stale results are cleared above
+    # Lock directory will be cleaned up when stale (age > 60s) or on next check
+}
+
 # Function to toggle hyprwhspr
 toggle_hyprwhspr() {
     if is_hyprwhspr_running; then
-        echo "Stopping hyprwhspr..."
+        echo "Stopping hyprwhspr..." >&2
         systemctl --user stop hyprwhspr.service
         show_notification "hyprwhspr" "Stopped" "low"
     else
         if can_start_recording; then
-            echo "Starting hyprwhspr..."
+            echo "Starting hyprwhspr..." >&2
             systemctl --user start hyprwhspr.service
             show_notification "hyprwhspr" "Started" "normal"
         else
-            echo "Cannot start hyprwhspr - no microphone available"
+            echo "Cannot start hyprwhspr - no microphone available" >&2
             show_notification "hyprwhspr" "No microphone available" "critical"
             return 1
         fi
     fi
 }
 
+# Function to control recording (start/stop)
+control_recording() {
+    local control_file="$HOME/.config/hyprwhspr/recording_control"
+
+    # Check if currently recording
+    if is_hyprwhspr_recording; then
+        # Stop recording
+        echo "stop" > "$control_file"
+        # No notification - Waybar icon change provides visual feedback
+    else
+        # Start recording - ensure service is running first
+        if ! is_hyprwhspr_running; then
+            if can_start_recording; then
+                echo "Starting hyprwhspr service..." >&2
+                systemctl --user start hyprwhspr.service
+                # Wait a moment for service to initialize
+                sleep 0.5
+            else
+                show_notification "hyprwhspr" "No microphone available" "critical"
+                return 1
+            fi
+        fi
+
+        # Write start command to control file
+        echo "start" > "$control_file"
+        # No notification - Waybar icon change provides visual feedback
+    fi
+}
+
 # Function to start ydotoold if needed
 start_ydotoold() {
     if ! is_ydotoold_running; then
-        echo "Starting ydotoold..."
+        echo "Starting ydotoold..." >&2
         systemctl --user start ydotool.service  # Using system service
         sleep 1
         if is_ydotoold_running; then
@@ -342,7 +537,7 @@ check_service_health() {
         
         if [ "$service_status" = "activating" ]; then
             # Service is stuck starting, restart it
-            echo "Service stuck in activating state, restarting..."
+            echo "Service stuck in activating state, restarting..." >&2
             systemctl --user restart hyprwhspr.service
             return 1
         fi
@@ -356,67 +551,15 @@ check_service_health() {
     return 0
 }
 
-# Function to get audio level visualization
-get_audio_level_viz() {
-    local level_file="$HOME/.config/hyprwhspr/audio_level"
-    
-    if [[ ! -f "$level_file" ]]; then
-        echo ""
-        return
-    fi
-    
-    local level
-    level=$(cat "$level_file" 2>/dev/null || echo "0")
-    
-    # Convert level (0.0-1.0) to multi-segment dot visualization
-    # Using smaller Unicode characters for pixel-like appearance
-    local num_segments=12
-    local inactive_char="·"  # middle dot for inactive segments
-    local active_char="▪"    # small square for active segments
-    
-    # Apply non-linear scaling for better sensitivity to lower levels
-    # Using square root curve: makes quiet sounds more visible
-    # This maps low levels (0.0-0.3) to more segments for better responsiveness
-    local active_segments=$(awk -v l="$level" -v n="$num_segments" 'BEGIN {
-        # Apply square root scaling for better sensitivity
-        # This makes lower levels fill more segments
-        scaled = sqrt(l) * n
-        segs = int(scaled + 0.5)  # Round to nearest integer
-        if (segs > n) segs = n
-        if (segs < 0) segs = 0
-        print segs
-    }')
-    
-    # Build the visualization string
-    local viz=""
-    local i
-    for ((i=0; i<num_segments; i++)); do
-        if [ $i -lt $active_segments ]; then
-            viz="${viz}${active_char}"
-        else
-            viz="${viz}${inactive_char}"
-        fi
-    done
-    
-    echo "$viz"
-}
-
 # Function to emit JSON output for waybar with granular error classes
 emit_json() {
     local state="$1" reason="${2:-}" custom_tooltip="${3:-}"
     local icon text tooltip class="$state"
-    local audio_viz=""
-    
-    # Get audio visualization if recording
-    if [[ "$state" == "recording" ]]; then
-        audio_viz=$(get_audio_level_viz)
-        [[ -n "$audio_viz" ]] && audio_viz=" $audio_viz"
-    fi
     
     case "$state" in
         "recording")
             icon=""
-            text="$icon$audio_viz"
+            text="$icon"
             tooltip="hyprwhspr: Currently recording\n\nLeft-click: Stop recording\nRight-click: Restart service"
             ;;
         "error")
@@ -424,13 +567,13 @@ emit_json() {
             text="$icon ERR"
             case "$reason" in
                 mic_unavailable)
-                    tooltip="hyprwhspr: Microphone not available\n\nMicrophone hardware is present but cannot capture audio.\nThis often happens after suspend/resume or boot.\n\nPlease unplug and replug your USB microphone.\n\nLeft-click: Toggle service\nRight-click: Restart service"
+                    tooltip="hyprwhspr: Microphone not available\n\nMicrophone hardware is present but cannot capture audio.\nThis often happens after suspend/resume or boot.\n\nPlease unplug and replug your USB microphone.\n\nLeft-click: Start recording\nRight-click: Restart service"
                     ;;
                 mic_no_audio)
-                    tooltip="hyprwhspr: Recording but no audio input\n\nRecording is active but microphone is not providing audio.\nThis indicates the mic needs to be reconnected.\n\nPlease unplug and replug your USB microphone.\n\nLeft-click: Toggle service\nRight-click: Restart service"
+                    tooltip="hyprwhspr: Recording but no audio input\n\nRecording is active but microphone is not providing audio.\nThis indicates the mic needs to be reconnected.\n\nPlease unplug and replug your USB microphone.\n\nLeft-click: Start recording\nRight-click: Restart service"
                     ;;
                 *)
-            tooltip="hyprwhspr: Issue detected${reason:+ ($reason)}\n\nLeft-click: Toggle service\nRight-click: Restart service"
+            tooltip="hyprwhspr: Issue detected${reason:+ ($reason)}\n\nLeft-click: Start recording\nRight-click: Restart service"
 ;;
             esac
             class="error"
@@ -438,17 +581,17 @@ emit_json() {
         "ready")
             icon=""
             text="$icon"
-            tooltip="hyprwhspr: Ready to record\n\nLeft-click: Toggle service\nRight-click: Restart service"
+            tooltip="hyprwhspr: Ready to record\n\nLeft-click: Start recording\nRight-click: Restart service"
             ;;
         "stopped")
             icon=""
             text="$icon"
-            tooltip="hyprwhspr: Stopped\n\nLeft-click: Start service\nRight-click: Restart service"
+            tooltip="hyprwhspr: Stopped\n\nLeft-click: Start recording\nRight-click: Restart service"
             ;;
         *)
             icon="󰆉"
             text="$icon"
-            tooltip="hyprwhspr: Unknown state\n\nLeft-click: Toggle service\nRight-click: Restart service"
+            tooltip="hyprwhspr: Unknown state\n\nLeft-click: Start recording\nRight-click: Restart service"
             class="error"
             state="error"
             ;;
@@ -516,10 +659,31 @@ get_current_state() {
     if ! is_ydotoold_running; then
         echo "error:ydotoold"; return
     fi
-    
+
     # Check if mic is present and accessible
-    if ! mic_present || ! mic_accessible; then
-        echo "error:mic_unavailable"; return
+    # BUT: if recovery just succeeded (within last 5 seconds), give it grace period
+    local recovery_file="$HOME/.config/hyprwhspr/recovery_result"
+    local in_recovery_grace=false
+    if [[ -f "$recovery_file" ]]; then
+        local result=$(cat "$recovery_file" 2>/dev/null)
+        local status="${result%%:*}"
+        local rest="${result#*:}"
+        local reason="${rest%%:*}"
+        local timestamp="${rest#*:}"
+        local current_time=$(date +%s)
+        local result_age=$((current_time - timestamp))
+
+        # If recovery succeeded within last 5 seconds, we're in grace period
+        if [[ "$status" == "success" && $result_age -lt 5 ]]; then
+            in_recovery_grace=true
+        fi
+    fi
+
+    # Only check mic if NOT in recovery grace period
+    if [[ "$in_recovery_grace" == "false" ]]; then
+        if ! mic_present || ! mic_accessible; then
+            echo "error:mic_unavailable"; return
+        fi
     fi
     
     # Check for zero-volume signal from main app (mic present but not working)
@@ -552,13 +716,26 @@ get_current_state() {
 # Main menu
 case "${1:-status}" in
     "status")
+        # Check for recovery results and show notifications
+        check_recovery_result
         IFS=: read -r s r <<<"$(get_current_state)"
         emit_json "$s" "$r" "$(mic_tooltip_line)"
         ;;
     "toggle")
         toggle_hyprwhspr
         IFS=: read -r s r <<<"$(get_current_state)"
-        emit_json "$s" "$r" "$(mic_tooltip_line)"
+        # Only output JSON if stdout is not a TTY (i.e., being called by Waybar)
+        if [ ! -t 1 ]; then
+            emit_json "$s" "$r" "$(mic_tooltip_line)"
+        fi
+        ;;
+    "record")
+        control_recording
+        IFS=: read -r s r <<<"$(get_current_state)"
+        # Only output JSON if stdout is not a TTY (i.e., being called by Waybar)
+        if [ ! -t 1 ]; then
+            emit_json "$s" "$r" "$(mic_tooltip_line)"
+        fi
         ;;
     "start")
         if ! is_hyprwhspr_running; then
@@ -570,7 +747,10 @@ case "${1:-status}" in
             fi
         fi
         IFS=: read -r s r <<<"$(get_current_state)"
-        emit_json "$s" "$r" "$(mic_tooltip_line)"
+        # Only output JSON if stdout is not a TTY (i.e., being called by Waybar)
+        if [ ! -t 1 ]; then
+            emit_json "$s" "$r" "$(mic_tooltip_line)"
+        fi
         ;;
     "stop")
         if is_hyprwhspr_running; then
@@ -578,31 +758,43 @@ case "${1:-status}" in
             show_notification "hyprwhspr" "Stopped" "low"
         fi
         IFS=: read -r s r <<<"$(get_current_state)"
-        emit_json "$s" "$r" "$(mic_tooltip_line)"
+        # Only output JSON if stdout is not a TTY (i.e., being called by Waybar)
+        if [ ! -t 1 ]; then
+            emit_json "$s" "$r" "$(mic_tooltip_line)"
+        fi
         ;;
     "ydotoold")
         start_ydotoold
         IFS=: read -r s r <<<"$(get_current_state)"
-        emit_json "$s" "$r" "$(mic_tooltip_line)"
+        # Only output JSON if stdout is not a TTY (i.e., being called by Waybar)
+        if [ ! -t 1 ]; then
+            emit_json "$s" "$r" "$(mic_tooltip_line)"
+        fi
         ;;
     "restart")
         systemctl --user restart hyprwhspr.service
         show_notification "hyprwhspr" "Restarted" "normal"
         IFS=: read -r s r <<<"$(get_current_state)"
-        emit_json "$s" "$r" "$(mic_tooltip_line)"
+        # Only output JSON if stdout is not a TTY (i.e., being called by Waybar)
+        if [ ! -t 1 ]; then
+            emit_json "$s" "$r" "$(mic_tooltip_line)"
+        fi
         ;;
     "health")
         check_service_health
         if [ $? -eq 0 ]; then
-            echo "Service health check passed"
+            echo "Service health check passed" >&2
         else
-            echo "Service health check failed, attempting recovery"
+            echo "Service health check failed, attempting recovery" >&2
         fi
         IFS=: read -r s r <<<"$(get_current_state)"
-        emit_json "$s" "$r" "$(mic_tooltip_line)"
+        # Only output JSON if stdout is not a TTY (i.e., being called by Waybar)
+        if [ ! -t 1 ]; then
+            emit_json "$s" "$r" "$(mic_tooltip_line)"
+        fi
         ;;
     *)
-        echo "Usage: $0 [status|toggle|start|stop|ydotoold|restart|health]"
+        echo "Usage: $0 [status|toggle|record|start|stop|ydotoold|restart|health]"
         echo ""
         echo "Commands:"
         echo "  status    - Show current status (JSON output)"
