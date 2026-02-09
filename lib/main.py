@@ -144,6 +144,7 @@ class hyprwhsprApp:
 
         # Long-form recording mode state
         self._longform_state = 'IDLE'  # IDLE, RECORDING, PAUSED, PROCESSING, ERROR
+        self._longform_language_override = None  # Language override for long-form session
         self._longform_lock = threading.Lock()
         self._longform_segment_manager = None
         self._longform_auto_save_timer = None
@@ -206,6 +207,7 @@ class hyprwhsprApp:
             recording_mode = self.config.get_setting("recording_mode", "toggle")
             grab_keys = self.config.get_setting("grab_keys", False)
             selected_device_path = self.config.get_setting("selected_device_path", None)
+            selected_device_name = self.config.get_setting("selected_device_name", None)
 
             # Register callbacks based on recording mode
             # Validate recording_mode and only register release callback for modes that need it
@@ -216,6 +218,7 @@ class hyprwhsprApp:
                     self._on_shortcut_triggered,
                     None,  # No release callback for toggle mode
                     device_path=selected_device_path,
+                    device_name=selected_device_name,
                     grab_keys=grab_keys,
                 )
             elif recording_mode in ('push_to_talk', 'auto'):
@@ -225,6 +228,7 @@ class hyprwhsprApp:
                     self._on_shortcut_triggered,
                     self._on_shortcut_released,
                     device_path=selected_device_path,
+                    device_name=selected_device_name,
                     grab_keys=grab_keys,
                 )
             elif recording_mode == 'long_form':
@@ -234,6 +238,7 @@ class hyprwhsprApp:
                     self._on_longform_shortcut_triggered,
                     None,  # No release callback for long_form mode
                     device_path=selected_device_path,
+                    device_name=selected_device_name,
                     grab_keys=grab_keys,
                 )
                 # Initialize segment manager for long-form mode
@@ -250,6 +255,7 @@ class hyprwhsprApp:
                     self._on_shortcut_triggered,
                     None,  # No release callback for invalid modes (treated as toggle)
                     device_path=selected_device_path,
+                    device_name=selected_device_name,
                     grab_keys=grab_keys,
                 )
         except Exception as e:
@@ -269,6 +275,7 @@ class hyprwhsprApp:
                             self._on_secondary_shortcut_triggered,
                             None,  # No release callback for toggle mode
                             device_path=selected_device_path,
+                            device_name=selected_device_name,
                             grab_keys=grab_keys,
                         )
                     elif recording_mode in ('push_to_talk', 'auto'):
@@ -277,6 +284,7 @@ class hyprwhsprApp:
                             self._on_secondary_shortcut_triggered,
                             self._on_secondary_shortcut_released,
                             device_path=selected_device_path,
+                            device_name=selected_device_name,
                             grab_keys=grab_keys,
                         )
                     else:
@@ -286,6 +294,7 @@ class hyprwhsprApp:
                             self._on_secondary_shortcut_triggered,
                             None,
                             device_path=selected_device_path,
+                            device_name=selected_device_name,
                             grab_keys=grab_keys,
                         )
                     
@@ -311,6 +320,7 @@ class hyprwhsprApp:
                         self._on_longform_submit_triggered,
                         None,  # No release callback
                         device_path=selected_device_path,
+                        device_name=selected_device_name,
                         grab_keys=grab_keys,
                     )
                     if self._longform_submit_shortcuts.start():
@@ -521,18 +531,22 @@ class hyprwhsprApp:
 
     def _on_shortcut_triggered(self):
         """Handle global shortcut trigger (key press)"""
+        self._handle_shortcut_triggered()
+
+    def _handle_shortcut_triggered(self, language_override=None):
+        """Shared logic for handling shortcut trigger with optional language override"""
         recording_mode = self.config.get_setting("recording_mode", "toggle")
-        
+
         if recording_mode == 'toggle':
             # Toggle mode: start/stop recording
             if self.is_recording:
                 self._stop_recording()
             else:
-                self._start_recording()
+                self._start_recording(language_override=language_override)
         elif recording_mode == 'push_to_talk':
             # Push-to-talk mode: only start recording on key press
             if not self.is_recording:
-                self._start_recording()
+                self._start_recording(language_override=language_override)
         elif recording_mode == 'auto':
             # Auto mode (hybrid tap/hold): record timestamp and start if not recording
             # Synchronize access to state variables to prevent race conditions
@@ -544,7 +558,7 @@ class hyprwhsprApp:
                     self._shortcut_press_time = 0.0
                     self._recording_started_this_press = False
                     self._tap_threshold = 0.4
-                
+
                 self._shortcut_press_time = time.time()
                 if not self.is_recording:
                     self._recording_started_this_press = True
@@ -553,16 +567,16 @@ class hyprwhsprApp:
                     # Already recording - will be stopped on release if this is a tap
                     self._recording_started_this_press = False
                     should_start = False
-            
+
             # Call _start_recording() outside the lock to avoid blocking release callback
             if should_start:
-                self._start_recording()
+                self._start_recording(language_override=language_override)
         else:
             # Invalid mode, default to toggle behavior
             if self.is_recording:
                 self._stop_recording()
             else:
-                self._start_recording()
+                self._start_recording(language_override=language_override)
 
     def _on_shortcut_released(self):
         """Handle global shortcut release (key release)
@@ -607,90 +621,11 @@ class hyprwhsprApp:
 
     def _on_secondary_shortcut_triggered(self):
         """Handle secondary shortcut trigger (key press) with language override"""
-        recording_mode = self.config.get_setting("recording_mode", "toggle")
         secondary_language = self.config.get_setting("secondary_language", None)
-        
-        if recording_mode == 'toggle':
-            # Toggle mode: start/stop recording
-            if self.is_recording:
-                self._stop_recording()
-            else:
-                self._start_recording(language_override=secondary_language)
-        elif recording_mode == 'push_to_talk':
-            # Push-to-talk mode: only start recording on key press
-            if not self.is_recording:
-                self._start_recording(language_override=secondary_language)
-        elif recording_mode == 'auto':
-            # Auto mode (hybrid tap/hold): record timestamp and start if not recording
-            # Synchronize access to state variables to prevent race conditions
-            # Don't call _start_recording() inside the lock to avoid blocking release callback
-            # Initialize state variables if they're None (e.g., if mode was changed from non-auto)
-            with self._auto_mode_lock:
-                # Ensure variables are initialized (handles mode change from non-auto to auto)
-                if self._shortcut_press_time is None:
-                    self._shortcut_press_time = 0.0
-                    self._recording_started_this_press = False
-                    self._tap_threshold = 0.4
-                
-                self._shortcut_press_time = time.time()
-                if not self.is_recording:
-                    self._recording_started_this_press = True
-                    should_start = True
-                else:
-                    # Already recording - will be stopped on release if this is a tap
-                    self._recording_started_this_press = False
-                    should_start = False
-            
-            # Call _start_recording() outside the lock to avoid blocking release callback
-            if should_start:
-                self._start_recording(language_override=secondary_language)
-        else:
-            # Invalid mode, default to toggle behavior
-            if self.is_recording:
-                self._stop_recording()
-            else:
-                self._start_recording(language_override=secondary_language)
+        self._handle_shortcut_triggered(language_override=secondary_language)
 
-    def _on_secondary_shortcut_released(self):
-        """Handle secondary shortcut release (key release)
-        
-        Only called for 'push_to_talk' and 'auto' modes (not 'toggle')
-        """
-        recording_mode = self.config.get_setting("recording_mode", "toggle")
-        
-        if recording_mode == 'push_to_talk':
-            # Push-to-talk mode: stop recording on key release
-            if self.is_recording:
-                self._stop_recording()
-        elif recording_mode == 'auto':
-            # Auto mode (hybrid tap/hold): determine behavior based on hold duration
-            if not self.is_recording:
-                return
-            
-            # Synchronize access to state variables to prevent race conditions
-            # Calculate hold_duration inside the lock to ensure consistent timing
-            with self._auto_mode_lock:
-                press_time = self._shortcut_press_time
-                started_this_press = self._recording_started_this_press
-                release_time = time.time()  # Capture release time while holding lock
-                
-                # Validate press_time is not None (handles mode change from non-auto to auto)
-                if press_time is None:
-                    # State not initialized - treat as hold (stop recording)
-                    self._stop_recording()
-                    return
-                
-                hold_duration = release_time - press_time
-                tap_threshold = self._tap_threshold if self._tap_threshold is not None else 0.4
-
-            if hold_duration >= tap_threshold:
-                # Hold (>= 400ms): always stop recording (push-to-talk behavior)
-                self._stop_recording()
-            else:
-                # Tap (< 400ms): only stop if we didn't start recording on this press (toggle off)
-                if not started_this_press:
-                    self._stop_recording()
-                # Otherwise, keep recording (tap started it, let it continue)
+    # Secondary release is identical to primary release - reuse the same handler
+    _on_secondary_shortcut_released = _on_shortcut_released
 
     # Long-form recording mode handlers
     def _ensure_longform_initialized(self):
@@ -740,9 +675,17 @@ class hyprwhsprApp:
             elif self._longform_state == 'PROCESSING':
                 print("[LONGFORM] Already processing, please wait")
 
-    def _longform_start_recording(self):
-        """Start recording in long-form mode"""
-        print("[LONGFORM] Starting recording session")
+    def _longform_start_recording(self, language_override=None):
+        """Start recording in long-form mode
+
+        Args:
+            language_override: Optional language code for transcription (e.g., 'en', 'it')
+        """
+        lang_info = f" (language: {language_override})" if language_override else ""
+        print(f"[LONGFORM] Starting recording session{lang_info}")
+
+        # Store language override for use during submit
+        self._longform_language_override = language_override
 
         # Start audio capture first to verify it works
         if not self.audio_capture.start_recording():
@@ -841,8 +784,10 @@ class hyprwhsprApp:
         try:
             self.is_processing = True
 
-            # Transcribe
-            transcription = self.whisper_manager.transcribe_audio(audio_data)
+            # Transcribe with language override if set
+            transcription = self.whisper_manager.transcribe_audio(
+                audio_data, language_override=self._longform_language_override
+            )
 
             if transcription and transcription.strip():
                 text = transcription.strip()
@@ -862,9 +807,10 @@ class hyprwhsprApp:
                 # Success - inject text
                 self._inject_text(text)
 
-                # Clear segments and error audio
+                # Clear segments, error audio, and language override
                 self._longform_segment_manager.clear_session()
                 self._longform_error_audio = None
+                self._longform_language_override = None
 
                 self._longform_state = 'IDLE'
                 self._write_longform_state('IDLE')
@@ -988,13 +934,28 @@ class hyprwhsprApp:
             
             # Check if using realtime-ws backend and get streaming callback
             streaming_callback = self.whisper_manager.get_realtime_streaming_callback()
+            backend = normalize_backend(self.config.get_setting('transcription_backend', 'pywhispercpp'))
+            if backend == 'realtime-ws' and streaming_callback is None:
+                # Fail fast: realtime-ws requires an active streaming callback (and a connected client)
+                self.is_recording = False
+                self._write_recording_status(False)
+                self._hide_mic_osd()
+                self._stop_audio_level_monitoring()
+                self._notify_zero_volume(
+                    "Realtime backend not connected (WebSocket closed while idle?). Try again.",
+                    log_level="ERROR",
+                )
+                # Restore audio if it was ducked
+                if self.audio_ducker.is_ducked:
+                    self.audio_ducker.restore()
+                return
             
             # Helper function to verify stream is working and play sound
             def verify_and_play_sound():
                 """Wait for callbacks and play sound if stream works"""
                 import time
                 start_time = time.monotonic()
-                while time.monotonic() - start_time < 0.5:  # Wait up to 500ms
+                while time.monotonic() - start_time < 1.5:  # Wait up to 1.5s
                     # Read frames_since_start with lock held to avoid data race
                     with self.audio_capture.lock:
                         frames_count = self.audio_capture.frames_since_start
@@ -1297,6 +1258,7 @@ class hyprwhsprApp:
         """Inject transcribed text into active application"""
         try:
             self.text_injector.inject_text(text)
+            print(f"[INJECT] Text injected ({len(text)} chars)", flush=True)
 
             # Text injection succeeded - system is fully healthy
             # Cancel any pending background recovery
@@ -1638,33 +1600,58 @@ class hyprwhsprApp:
                 
                 # Open FIFO for reading (blocks until writer appears)
                 with open(RECORDING_CONTROL_FILE, 'r') as f:
-                    action = f.read().strip().lower()
-                
-                if not action:
+                    raw_data = f.read()
+
+                # Handle multiple commands written to FIFO before read
+                # (e.g., user clicks rapidly during timeout - "start\nstart")
+                # Take only the last valid command (most recent intent)
+                # Commands can be: 'start', 'start:lang', 'stop', 'submit'
+                valid_base_commands = {'start', 'stop', 'submit'}
+                lines = [line.strip() for line in raw_data.splitlines() if line.strip()]
+
+                # Parse commands - extract base command and optional language
+                parsed_commands = []
+                for line in lines:
+                    line_lower = line.lower()
+                    if ':' in line_lower and line_lower.startswith('start:'):
+                        # start:lang format - preserve language case
+                        parts = line.split(':', 1)
+                        lang = parts[1].strip() if len(parts) > 1 else None
+                        parsed_commands.append(('start', lang))
+                    elif line_lower in valid_base_commands:
+                        parsed_commands.append((line_lower, None))
+
+                if not parsed_commands:
+                    if lines:
+                        print(f"[CONTROL] No valid commands in: {lines}", flush=True)
                     continue
+
+                action, language_param = parsed_commands[-1]  # Take the last valid command
                 
                 # Check recording mode to route to appropriate handler
                 recording_mode = self.config.get_setting("recording_mode", "toggle")
                 
                 # Process action immediately
                 if action == "start":
+                    lang_info = f" (language: {language_param})" if language_param else ""
                     if recording_mode == "long_form":
                         # In long-form mode, "start" action is state-aware
                         self._ensure_longform_initialized()
                         with self._longform_lock:
                             if self._longform_state == 'IDLE':
-                                print("[CONTROL] Long-form start requested (immediate)", flush=True)
-                                self._longform_start_recording()
+                                print(f"[CONTROL] Long-form start requested (immediate){lang_info}", flush=True)
+                                self._longform_start_recording(language_override=language_param)
                             elif self._longform_state == 'PAUSED':
-                                print("[CONTROL] Long-form resume requested (immediate)", flush=True)
+                                print(f"[CONTROL] Long-form resume requested (immediate){lang_info}", flush=True)
+                                # Note: resume doesn't change language - it was set at session start
                                 self._longform_resume_recording()
                             elif self._longform_state == 'RECORDING':
                                 print("[CONTROL] Long-form already recording, ignoring start request", flush=True)
                             else:
                                 print(f"[CONTROL] Long-form in {self._longform_state} state, ignoring start request", flush=True)
                     elif not self.is_recording:
-                        print("[CONTROL] Recording start requested (immediate)", flush=True)
-                        self._start_recording()
+                        print(f"[CONTROL] Recording start requested (immediate){lang_info}", flush=True)
+                        self._start_recording(language_override=language_param)
                     else:
                         print("[CONTROL] Recording already in progress, ignoring start request", flush=True)
                 elif action == "stop":

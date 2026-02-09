@@ -25,6 +25,8 @@ class ConfigManager:
             'recording_mode': 'toggle',  # 'toggle' | 'push_to_talk' | 'auto' (hybrid tap/hold)
             'grab_keys': False,     # Exclusive keyboard grab (false = safer, true = suppress shortcut from other apps)
             'use_hypr_bindings': False,  # Use Hyprland compositor bindings instead of evdev (disables GlobalShortcuts)
+            'selected_device_path': None,  # Specific keyboard device path (e.g., '/dev/input/event3')
+            'selected_device_name': None,  # Specific keyboard device name (e.g., 'USB Keyboard') - takes priority over path if both set
             # Audio device persistence (for reliable device matching across reboots)
             'audio_device_id': None,        # PortAudio device index (can change on reboot)
             'audio_device_name': None,      # Human-readable device name (more stable)
@@ -34,12 +36,23 @@ class ConfigManager:
             'threads': 4,           # Thread count for whisper processing
             'language': None,       # Language code for transcription (None = auto-detect, or 'en', 'nl', 'fr', etc.)
             'word_overrides': {},  # Dictionary of word replacements: {"original": "replacement"}
+            'filter_filler_words': False,  # Remove common filler words (uh, um, er, etc.)
+            'filler_words': ['uh', 'um', 'er', 'ah', 'eh', 'hmm', 'hm', 'mm', 'mhm'],  # Filler words to remove
+            'symbol_replacements': True,  # Enable built-in speech-to-symbol replacements (e.g., "quote" → ")
             'whisper_prompt': 'Transcribe with proper capitalization, including sentence beginnings, proper nouns, titles, and standard English capitalization rules.',
             'clipboard_behavior': False,  # Boolean: true = clear clipboard after delay, false = keep (current behavior)
             'clipboard_clear_delay': 5.0,  # Float: seconds to wait before clearing clipboard (only used if clipboard_behavior is true)
             # Values: "super" | "ctrl_shift" | "ctrl"
             # Default "ctrl_shift" for flexible unix-y primitive
             'paste_mode': 'ctrl_shift',
+            # Wayland/XKB keycode as printed by `wev` for the key that types 'v'.
+            # If set, hyprwhspr will convert it to Linux evdev by subtracting 8.
+            # This avoids users having to do the math themselves.
+            'paste_keycode_wev': None,
+            # ydotool sends Linux evdev keycodes (physical keys), not keysyms/characters.
+            # Default 47 = KEY_V (works on QWERTY; on other layouts set this to the keycode
+            # for the physical key that produces 'v' on your layout).
+            'paste_keycode': 47,
             # Back-compat for older configs (used only if paste_mode is absent):
             'shift_paste': True,  # true = Ctrl+Shift+V, false = Ctrl+V
             # Transcription backend settings
@@ -198,7 +211,36 @@ class ConfigManager:
     def clear_word_overrides(self):
         """Clear all word overrides"""
         self.config['word_overrides'] = {}
-    
+
+    def get_filter_filler_words(self) -> bool:
+        """Check if filler word filtering is enabled"""
+        return self.config.get('filter_filler_words', False)
+
+    def set_filter_filler_words(self, enabled: bool):
+        """Enable or disable filler word filtering"""
+        self.config['filter_filler_words'] = bool(enabled)
+
+    def get_filler_words(self) -> list:
+        """Get the list of filler words to filter"""
+        return self.config.get('filler_words', ['uh', 'um', 'er', 'ah', 'eh', 'hmm', 'hm', 'mm', 'mhm']).copy()
+
+    def add_filler_word(self, word: str):
+        """Add a word to the filler words list"""
+        word = word.lower().strip()
+        if word:
+            filler_words = self.get_filler_words()
+            if word not in filler_words:
+                filler_words.append(word)
+                self.config['filler_words'] = filler_words
+
+    def remove_filler_word(self, word: str):
+        """Remove a word from the filler words list"""
+        word = word.lower().strip()
+        filler_words = self.get_filler_words()
+        if word in filler_words:
+            filler_words.remove(word)
+            self.config['filler_words'] = filler_words
+
     def migrate_api_key_to_credential_manager(self) -> bool:
         """
         Migrate API key from config.json to credential manager.

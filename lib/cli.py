@@ -34,6 +34,8 @@ from cli_commands import (
     state_validate_command,
     state_reset_command,
     uninstall_command,
+    keyboard_command,
+    record_command,
 )
 
 
@@ -41,7 +43,7 @@ def main():
     """Main CLI entry point"""
     parser = argparse.ArgumentParser(
         prog='hyprwhspr',
-        description='hyprwhspr - Voice dictation service for Hyprland',
+        description='hyprwhspr - ferocious speech-to-text for Linux',
     )
     
     # Global verbosity flags
@@ -60,6 +62,8 @@ def main():
     
     # setup command
     setup_parser = subparsers.add_parser('setup', help='Full initial setup')
+    setup_parser.add_argument('--python', dest='python_path', metavar='PATH',
+                              help='Path to Python executable for venv (e.g., /usr/bin/python3.14)')
     setup_subparsers = setup_parser.add_subparsers(dest='setup_action', help='Setup actions')
     auto_parser = setup_subparsers.add_parser('auto', help='Automated setup')
     auto_parser.add_argument('--backend', choices=['nvidia', 'vulkan', 'cpu', 'onnx-asr'],
@@ -69,6 +73,8 @@ def main():
     auto_parser.add_argument('--no-mic-osd', action='store_true', help='Disable mic-osd visualization')
     auto_parser.add_argument('--no-systemd', action='store_true', help='Skip systemd service setup')
     auto_parser.add_argument('--hypr-bindings', action='store_true', help='Enable Hyprland compositor bindings')
+    auto_parser.add_argument('--python', dest='python_path', metavar='PATH',
+                             help='Path to Python executable for venv (e.g., /usr/bin/python3.14)')
 
     # install command
     install_parser = subparsers.add_parser('install', help='Installation management')
@@ -125,6 +131,24 @@ def main():
                             help='Record live audio instead of using test.wav')
     test_parser.add_argument('--mic-only', action='store_true',
                             help='Only test microphone, skip transcription')
+    
+    # keyboard command
+    keyboard_parser = subparsers.add_parser('keyboard', help='Keyboard device management')
+    keyboard_subparsers = keyboard_parser.add_subparsers(dest='keyboard_action', help='Keyboard actions')
+    keyboard_subparsers.add_parser('list', help='List available keyboard devices')
+    keyboard_subparsers.add_parser('test', help='Test keyboard device accessibility')
+
+    # record command (for external hotkey systems)
+    record_parser = subparsers.add_parser('record', help='Control recording (for external hotkeys)')
+    record_subparsers = record_parser.add_subparsers(dest='record_action', help='Recording actions')
+    record_start_parser = record_subparsers.add_parser('start', help='Start recording')
+    record_start_parser.add_argument('--lang', dest='language', metavar='CODE',
+                                     help='Language code for transcription (e.g., en, it, de)')
+    record_subparsers.add_parser('stop', help='Stop recording')
+    record_toggle_parser = record_subparsers.add_parser('toggle', help='Toggle recording on/off')
+    record_toggle_parser.add_argument('--lang', dest='language', metavar='CODE',
+                                      help='Language code for transcription (e.g., en, it, de)')
+    record_subparsers.add_parser('status', help='Show current recording status')
     
     # backend command
     backend_parser = subparsers.add_parser('backend', help='Backend management')
@@ -185,7 +209,8 @@ def main():
                 setup_parser.print_help()
                 sys.exit(1)
             else:
-                setup_command()
+                python_path = getattr(args, 'python_path', None)
+                setup_command(python_path=python_path)
         elif args.command == 'install':
             if not args.install_action:
                 install_parser.print_help()
@@ -228,6 +253,11 @@ def main():
                 live=getattr(args, 'live', False),
                 mic_only=getattr(args, 'mic_only', False)
             )
+        elif args.command == 'keyboard':
+            if not args.keyboard_action:
+                keyboard_parser.print_help()
+                sys.exit(1)
+            keyboard_command(args.keyboard_action)
         elif args.command == 'backend':
             if not args.backend_action:
                 backend_parser.print_help()
@@ -246,6 +276,11 @@ def main():
                 state_validate_command()
             elif args.state_action == 'reset':
                 state_reset_command(getattr(args, 'all', False))
+        elif args.command == 'record':
+            if not args.record_action:
+                record_parser.print_help()
+                sys.exit(1)
+            record_command(args.record_action, language=getattr(args, 'language', None))
         elif args.command == 'uninstall':
             uninstall_command(
                 keep_models=getattr(args, 'keep_models', False),

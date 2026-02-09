@@ -18,11 +18,17 @@ except (ImportError, ModuleNotFoundError) as e:
     # Hard fail – rich is required for the CLI
     print("ERROR: python-rich is not available in this Python environment.", file=sys.stderr)
     print(f"ImportError: {e}", file=sys.stderr)
+    print(f"\nPython being used: {sys.executable}", file=sys.stderr)
+    print(f"Python version:    {sys.version.split()[0]}", file=sys.stderr)
+    print("\nThis usually means python-rich is installed for a different Python version.", file=sys.stderr)
+    print("The CLI requires system Python with distro packages installed.", file=sys.stderr)
     print("\nTry installing it using your package manager:", file=sys.stderr)
     print("  Arch:          pacman -S python-rich", file=sys.stderr)
     print("  Debian/Ubuntu: apt install python3-rich", file=sys.stderr)
     print("  Fedora:        dnf install python3-rich", file=sys.stderr)
     print("  Or via pip:    pip install rich>=13.0.0", file=sys.stderr)
+    print("\nIf using a Python version manager (pyenv, mise, asdf), ensure", file=sys.stderr)
+    print("python-rich is installed for your system Python (/usr/bin/python3).", file=sys.stderr)
     sys.exit(1)
 
 try:
@@ -31,9 +37,9 @@ except ImportError:
     from config_manager import ConfigManager
 
 try:
-    from .paths import CONFIG_DIR, CONFIG_FILE
+    from .paths import CONFIG_DIR, CONFIG_FILE, RECORDING_CONTROL_FILE, RECORDING_STATUS_FILE
 except ImportError:
-    from paths import CONFIG_DIR, CONFIG_FILE
+    from paths import CONFIG_DIR, CONFIG_FILE, RECORDING_CONTROL_FILE, RECORDING_STATUS_FILE
 
 try:
     from .backend_utils import BACKEND_DISPLAY_NAMES, normalize_backend
@@ -45,14 +51,16 @@ try:
         install_backend, VENV_DIR, STATE_FILE, STATE_DIR,
         get_install_state, set_install_state, get_all_state,
         init_state, _cleanup_partial_installation,
-        PARAKEET_VENV_DIR, PARAKEET_SCRIPT, USER_BASE, PYWHISPERCPP_SRC_DIR
+        PARAKEET_VENV_DIR, PARAKEET_SCRIPT, USER_BASE, PYWHISPERCPP_SRC_DIR,
+        MAX_COMPATIBLE_PYTHON, _get_python_version
     )
 except ImportError:
     from backend_installer import (
         install_backend, VENV_DIR, STATE_FILE, STATE_DIR,
         get_install_state, set_install_state, get_all_state,
         init_state, _cleanup_partial_installation,
-        PARAKEET_VENV_DIR, PARAKEET_SCRIPT, USER_BASE, PYWHISPERCPP_SRC_DIR
+        PARAKEET_VENV_DIR, PARAKEET_SCRIPT, USER_BASE, PYWHISPERCPP_SRC_DIR,
+        MAX_COMPATIBLE_PYTHON, _get_python_version
     )
 
 try:
@@ -85,6 +93,11 @@ except ImportError:
         log_info, log_success, log_warning, log_error, log_debug, log_verbose,
         run_command, run_sudo_command, OutputController, VerbosityLevel
     )
+
+try:
+    from .global_shortcuts import get_available_keyboards, test_key_accessibility
+except ImportError:
+    from global_shortcuts import get_available_keyboards, test_key_accessibility
 
 
 # Constants
@@ -156,12 +169,75 @@ def _create_mise_free_environment() -> dict:
     return env
 
 
+def _check_python_compatibility() -> tuple[bool, str, str]:
+    """
+    Check if a compatible Python version is available for local ML backends.
+
+    ML packages (onnxruntime, etc.) require Python 3.14 or earlier.
+    This check warns users early if their system Python is too new.
+
+    Returns:
+        Tuple of (is_compatible, current_version_str, guidance_message)
+    """
+    max_str = f"{MAX_COMPATIBLE_PYTHON[0]}.{MAX_COMPATIBLE_PYTHON[1]}"
+
+    # Get current system Python version
+    python_path = shutil.which('python3') or shutil.which('python') or sys.executable
+    current_version = _get_python_version(python_path)
+
+    if not current_version:
+        return (True, "unknown", "")  # Can't detect, let it proceed
+
+    version_str = f"{current_version[0]}.{current_version[1]}"
+
+    if current_version <= MAX_COMPATIBLE_PYTHON:
+        return (True, version_str, "")
+
+    # Python is too new - search for a compatible alternative directly
+    # (Don't call _find_compatible_python() as it prints errors and exits on failure)
+    for minor in [14, 13, 12, 11]:
+        if (3, minor) > MAX_COMPATIBLE_PYTHON:
+            continue
+        for prefix in ['/usr/bin', '/usr/local/bin']:
+            alt_path = f"{prefix}/python3.{minor}"
+            if os.path.isfile(alt_path) and os.access(alt_path, os.X_OK):
+                test_version = _get_python_version(alt_path)
+                if test_version and test_version <= MAX_COMPATIBLE_PYTHON:
+                    # Found a compatible Python
+                    guidance = (
+                        f"System Python {version_str} is too new for ML packages.\n"
+                        f"Found compatible Python: python3.{minor} ({alt_path})\n"
+                        f"The installer will use this automatically."
+                    )
+                    return (True, version_str, guidance)
+
+    # No compatible Python available
+    guidance = (
+        f"System Python {version_str} is too new for ML packages (onnxruntime, etc.).\n"
+        f"Local transcription backends require Python {max_str} or earlier.\n"
+        f"\n"
+        f"Options:\n"
+        f"  1. Install Python 3.14 or 3.13:\n"
+        f"     Fedora:     sudo dnf install python3.14\n"
+        f"     Arch:       yay -S python314  # or python313\n"
+        f"     Ubuntu/Deb: sudo apt install python3.13\n"
+        f"\n"
+        f"  2. Use cloud transcription (no local Python requirement):\n"
+        f"     Select 'REST API' or 'Realtime WS' during backend selection\n"
+        f"\n"
+        f"  3. Specify Python path manually:\n"
+        f"     hyprwhspr setup --python /path/to/python3.14"
+    )
+    return (False, version_str, guidance)
+
+
 def _check_ydotool_version() -> tuple[bool, str, str]:
     """
     Check if ydotool is installed and has a compatible version.
 
     hyprwhspr requires ydotool 1.0+ for paste injection. Ubuntu/Debian apt
     repositories contain an outdated 0.1.x version that uses incompatible syntax.
+    Arch-based distros (Arch, Manjaro, CachyOS) typically have 1.0+ in their repos.
 
     Returns:
         Tuple of (is_compatible, version_string, message)
@@ -175,25 +251,58 @@ def _check_ydotool_version() -> tuple[bool, str, str]:
     if not shutil.which('ydotool'):
         return False, "", "ydotool not found"
 
-    # Get version
+    # Get version - try dpkg first (ydotool 1.0+ has no --version flag)
+    import re
+    version = None
+
+    # Try dpkg (Debian/Ubuntu)
     try:
         result = subprocess.run(
-            ['ydotool', '--version'],
+            ['dpkg', '-l', 'ydotool'],
             capture_output=True,
             text=True,
             timeout=5
         )
-        version_output = result.stdout + result.stderr
+        match = re.search(r'ii\s+ydotool\s+(\d+\.\d+\.?\d*)', result.stdout)
+        if match:
+            version = match.group(1)
     except Exception:
-        version_output = ""
+        pass
 
-    # Parse version (ydotool 1.0+ outputs "ydotool version X.Y.Z")
-    import re
-    match = re.search(r'(\d+\.\d+\.?\d*)', version_output)
-    if match:
-        version = match.group(1)
-    else:
-        # Can't parse version - assume old version
+    # Try pacman (Arch/Manjaro/CachyOS)
+    if not version:
+        try:
+            result = subprocess.run(
+                ['pacman', '-Q', 'ydotool'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            # Output format: "ydotool 1.0.4-2.1"
+            match = re.search(r'ydotool\s+(\d+\.\d+\.?\d*)', result.stdout)
+            if match:
+                version = match.group(1)
+        except Exception:
+            pass
+
+    # Fallback: try --version (old ydotool 0.1.x supports this)
+    if not version:
+        try:
+            result = subprocess.run(
+                ['ydotool', '--version'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            version_output = result.stdout + result.stderr
+            match = re.search(r'(\d+\.\d+\.?\d*)', version_output)
+            if match:
+                version = match.group(1)
+        except Exception:
+            pass
+
+    # If still no version, assume old
+    if not version:
         version = "0.1.0"
 
     # Compare versions
@@ -557,13 +666,15 @@ def _prompt_backend_selection():
             }
 
             # Warn if switching to different backend
+            switching_local_backends = False
             if current_backend and current_backend != selected:
                 print(f"\n⚠️  Switching from {backend_names.get(current_backend, current_backend)} to {backend_names.get(selected, selected)}")
 
                 if current_backend not in ['rest-api', 'remote', 'realtime-ws'] and selected not in ['rest-api', 'remote', 'realtime-ws']:
-                    print("This will uninstall the current backend and install the new one.")
+                    print("This will recreate the venv and install the new backend cleanly.")
                     if not Confirm.ask("Continue?", default=True):
                         continue
+                    switching_local_backends = True
                 elif selected in ['rest-api', 'realtime-ws']:
                     backend_type_name = 'REST API' if selected == 'rest-api' else 'Realtime WebSocket'
                     print(f"Switching to {backend_type_name} backend.")
@@ -605,10 +716,9 @@ def _prompt_backend_selection():
                 # If yes to reconfigure, continue to return with wants_reinstall=True for correct state tracking
 
             print(f"\n✓ Selected: {backend_names.get(selected, selected)}")
-            # Check if user wants to reinstall/reconfigure (same backend selected and they said yes)
-            # For local backends: wants_reinstall means reinstall
-            # For cloud backends: wants_reinstall means reconfigure (correctly tracks user intent)
-            wants_reinstall = (current_backend == selected)
+            # Force rebuild when: reinstalling same backend OR switching between local backends
+            # This ensures a clean venv without stale packages from the previous backend
+            wants_reinstall = (current_backend == selected) or switching_local_backends
             return (selected, False, wants_reinstall)  # Return tuple: (backend, cleanup_venv, wants_reinstall)
         except KeyboardInterrupt:
             print("\n\nCancelled by user.")
@@ -690,12 +800,33 @@ def _prompt_remote_provider_selection(filter_realtime: bool = False):
     # Filter providers if this is for realtime-ws (only show providers with websocket_endpoint)
     if filter_realtime:
         providers_list = []
-        for provider_id, provider_name, model_ids in all_providers_list:
+        for provider_id, provider_name, _model_ids in all_providers_list:
             provider = get_provider(provider_id)
-            if provider and provider.get('websocket_endpoint'):
-                providers_list.append((provider_id, provider_name, model_ids))
+            if not (provider and provider.get('websocket_endpoint')):
+                continue
+
+            # Only show providers that have realtime-capable models
+            models = get_provider_models(provider_id) or {}
+            realtime_model_ids = [
+                model_id
+                for model_id, model_data in models.items()
+                if model_data.get('realtime_model', False)
+            ]
+            if realtime_model_ids:
+                providers_list.append((provider_id, provider_name, realtime_model_ids))
     else:
-        providers_list = all_providers_list
+        # REST providers: only include providers with at least one REST-visible model
+        # (i.e. not marked hidden in provider_registry)
+        providers_list = []
+        for provider_id, provider_name, _model_ids in all_providers_list:
+            models = get_provider_models(provider_id) or {}
+            visible_model_ids = [
+                model_id
+                for model_id, model_data in models.items()
+                if not model_data.get('hidden', False)
+            ]
+            if visible_model_ids:
+                providers_list.append((provider_id, provider_name, visible_model_ids))
     
     provider_choices = []
     
@@ -980,8 +1111,13 @@ def _setup_command_symlink():
             log_info(f"  ln -sf {source_path} {symlink_path}")
 
 
-def setup_command():
-    """Interactive full initial setup"""
+def setup_command(python_path: Optional[str] = None):
+    """Interactive full initial setup
+
+    Args:
+        python_path: Optional path to Python executable to use for venv creation.
+                     If None, auto-detects a compatible Python (3.14 or earlier).
+    """
     print("\n" + "="*60)
     print("hyprwhspr setup")
     print("="*60)
@@ -998,6 +1134,28 @@ def setup_command():
             except Exception:
                 pass
         log_info("MISE deactivated for installation")
+
+    # Early Python version compatibility check
+    # This warns users upfront if their Python is too new for local ML backends
+    if not python_path:  # Only check if user didn't specify a custom Python
+        is_compatible, version_str, guidance = _check_python_compatibility()
+        if guidance:
+            # Either found alternative Python or need to warn user
+            if is_compatible:
+                log_info(f"Note: {guidance}")
+            else:
+                print("\n" + "="*60)
+                print("Python Version Warning")
+                print("="*60)
+                log_warning(f"System Python {version_str} detected")
+                print()
+                print(guidance)
+                print()
+                if not Confirm.ask("Continue anyway? (Cloud backends will still work)", default=True):
+                    log_info("Setup cancelled.")
+                    log_info("Install Python 3.14 or 3.13, then re-run: hyprwhspr setup")
+                    return
+                print()
 
     # Setup command symlink for git clone installs
     _setup_command_symlink()
@@ -1098,7 +1256,7 @@ def setup_command():
             else:
                 # Pass force_rebuild=True when reinstalling to ensure clean venv
                 # Use normalized backend to ensure 'amd' -> 'vulkan' for new installs
-                if not install_backend(backend_normalized, force_rebuild=wants_reinstall):
+                if not install_backend(backend_normalized, force_rebuild=wants_reinstall, custom_python=python_path):
                     log_error("Backend installation failed. Setup cannot continue.")
                     return
                 
@@ -1195,11 +1353,15 @@ def setup_command():
             return
         
         # Prompt for realtime mode
-        print("\nRealtime Mode:")
-        print("  1. Transcribe - Convert speech to text (default)")
-        print("  2. Converse - Voice-to-AI: speak and get AI responses")
-        mode_choice = Prompt.ask("Select mode", choices=['1', '2'], default='1')
-        realtime_mode = 'transcribe' if mode_choice == '1' else 'converse'
+        # NOTE: Only OpenAI (and custom OpenAI-compatible endpoints) support "converse".
+        if provider_id in ('openai', 'custom'):
+            print("\nRealtime Mode:")
+            print("  1. Transcribe - Convert speech to text (default)")
+            print("  2. Converse - Voice-to-AI: speak and get AI responses")
+            mode_choice = Prompt.ask("Select mode", choices=['1', '2'], default='1')
+            realtime_mode = 'transcribe' if mode_choice == '1' else 'converse'
+        else:
+            realtime_mode = 'transcribe'
         remote_config['realtime_mode'] = realtime_mode
         log_info(f"Realtime mode: {realtime_mode}")
     
@@ -1231,7 +1393,7 @@ def setup_command():
             python_bin = VENV_DIR / 'bin' / 'python'
             result = run_command([
                 'timeout', '5s', str(python_bin), '-c',
-                'import sounddevice, numpy, requests; import websocket'
+                'import sounddevice, numpy, requests; import websocket; import elevenlabs'
             ], check=False, capture_output=True, show_output_on_error=False)
             deps_installed = result.returncode == 0
         except Exception:
@@ -1806,6 +1968,7 @@ def omarchy_command(args=None):
             - no_mic_osd: Disable mic-osd visualization
             - no_systemd: Skip systemd service setup
             - hypr_bindings: Enable Hyprland compositor bindings
+            - python_path: Path to Python executable for venv creation
 
     Note: Hyprland compositor bindings are NOT configured by default.
     Use 'hyprwhspr setup' for interactive setup with Hyprland compositor options,
@@ -1826,6 +1989,7 @@ def omarchy_command(args=None):
     skip_mic_osd = getattr(args, 'no_mic_osd', False) if args else False
     skip_systemd = getattr(args, 'no_systemd', False) if args else False
     enable_hypr_bindings = getattr(args, 'hypr_bindings', False) if args else False
+    python_path = getattr(args, 'python_path', None) if args else None
 
     # 1. Print banner
     print("\n" + "="*60)
@@ -1865,7 +2029,7 @@ def omarchy_command(args=None):
     print("Backend Installation")
     print("="*60)
 
-    if not install_backend(backend, force_rebuild=False):
+    if not install_backend(backend, force_rebuild=False, custom_python=python_path):
         log_error("Backend installation failed")
         return False
     
@@ -3451,6 +3615,37 @@ def validate_command():
     except Exception:
         pass  # Config validation is optional, don't fail if it errors
 
+    # Check graphical session readiness
+    try:
+        result = subprocess.run(
+            ['systemctl', '--user', 'is-active', 'graphical-session.target'],
+            capture_output=True, text=True, timeout=5, check=False
+        )
+        if result.stdout.strip() == 'active':
+            log_success("✓ graphical-session.target is active")
+        else:
+            log_warning("⚠ graphical-session.target is not active")
+            print("  hyprwhspr starts with the graphical session.")
+            print("  A session manager like uwsm is needed to activate graphical-session.target.")
+            print("  See: https://github.com/Vladimir-csp/uwsm")
+    except Exception:
+        pass
+
+    # Check WAYLAND_DISPLAY in systemd user environment
+    try:
+        result = subprocess.run(
+            ['systemctl', '--user', 'show-environment'],
+            capture_output=True, text=True, timeout=5, check=False
+        )
+        if result.returncode == 0 and 'WAYLAND_DISPLAY=' in result.stdout:
+            log_success("✓ WAYLAND_DISPLAY set in systemd user environment")
+        else:
+            log_warning("⚠ WAYLAND_DISPLAY not found in systemd user environment")
+            print("  Add to ~/.config/hypr/hyprland.conf:")
+            print("    exec-once = dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE")
+    except Exception:
+        pass
+
     if all_ok:
         log_success("Validation passed")
     else:
@@ -3767,6 +3962,127 @@ def test_command(live: bool = False, mic_only: bool = False):
     return all_passed
 
 
+# ==================== Keyboard Command ====================
+
+def keyboard_command(action: str):
+    """Handle keyboard subcommands"""
+    if action == 'list':
+        list_keyboards()
+    elif action == 'test':
+        test_keyboard_access()
+    else:
+        log_error(f"Unknown keyboard action: {action}")
+
+
+def list_keyboards():
+    """List available keyboard devices"""
+    log_info("Discovering available keyboard devices...")
+    
+    try:
+        # Get current config to show selected device
+        config = ConfigManager()
+        shortcut = config.get_setting("primary_shortcut", "Super+Alt+D")
+        selected_device_name = config.get_setting("selected_device_name", None)
+        selected_device_path = config.get_setting("selected_device_path", None)
+        
+        # Get available keyboards
+        keyboards = get_available_keyboards(shortcut)
+        
+        if not keyboards:
+            log_warning("No accessible keyboard devices found")
+            log_info("Make sure you're in the 'input' group: sudo usermod -aG input $USER")
+            return
+        
+        print("\nAvailable keyboard devices:")
+        print("-" * 70)
+        
+        # Find which device would actually be selected (matching GlobalShortcuts logic)
+        selected_device_index = None
+        if selected_device_name:
+            search_name_lower = selected_device_name.lower()
+            for i, kb in enumerate(keyboards):
+                kb_name_lower = kb['name'].lower()
+                # Match GlobalShortcuts logic: exact match OR partial match
+                if kb_name_lower == search_name_lower or search_name_lower in kb_name_lower:
+                    selected_device_index = i
+                    break  # Use first match, same as GlobalShortcuts
+        elif selected_device_path:
+            for i, kb in enumerate(keyboards):
+                if kb['path'] == selected_device_path:
+                    selected_device_index = i
+                    break
+        
+        for i, kb in enumerate(keyboards, 1):
+            # Mark only the device that would actually be selected
+            marker = " [SELECTED]" if (i - 1) == selected_device_index else ""
+            print(f"  {i}. {kb['name']}")
+            print(f"     Path: {kb['path']}{marker}")
+        
+        print("-" * 70)
+        print(f"\nTotal: {len(keyboards)} accessible device(s)")
+        
+        if selected_device_name:
+            print(f"\nCurrently selected by name: '{selected_device_name}'")
+        elif selected_device_path:
+            print(f"\nCurrently selected by path: {selected_device_path}")
+        else:
+            print("\nNo specific device selected - using auto-detection")
+        
+        print("\nTo select a device, add to your config (~/.config/hyprwhspr/config.json):")
+        print('  "selected_device_name": "Device Name"')
+        print('  or')
+        print('  "selected_device_path": "/dev/input/eventX"')
+        
+    except Exception as e:
+        log_error(f"Error listing keyboards: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def test_keyboard_access():
+    """Test keyboard device accessibility"""
+    log_info("Testing keyboard device accessibility...")
+    
+    try:
+        results = test_key_accessibility()
+        
+        print("\n" + "=" * 70)
+        print("Keyboard Device Accessibility Test")
+        print("=" * 70)
+        
+        print(f"\nTotal devices found: {results['total_devices']}")
+        print(f"Accessible devices: {len(results['accessible_devices'])}")
+        print(f"Inaccessible devices: {len(results['inaccessible_devices'])}")
+        
+        if results['accessible_devices']:
+            print("\n✓ Accessible devices:")
+            for dev in results['accessible_devices']:
+                print(f"  - {dev['name']}")
+                print(f"    Path: {dev['path']}")
+        
+        if results['inaccessible_devices']:
+            print("\n✗ Inaccessible devices:")
+            for dev in results['inaccessible_devices']:
+                print(f"  - {dev['name']}")
+                print(f"    Path: {dev['path']}")
+            print("\nNote: Inaccessible devices may be in use by another process")
+            print("      (e.g., Espanso, keyd, kmonad) or require permissions")
+        
+        if not results['accessible_devices']:
+            print("\n⚠ No accessible devices found!")
+            print("Solutions:")
+            print("  1. Add yourself to 'input' group: sudo usermod -aG input $USER")
+            print("     (then log out and back in)")
+            print("  2. Check if devices are grabbed by other tools:")
+            print("     sudo fuser /dev/input/event*")
+            print("  3. Consider using 'selected_device_name' in config to avoid conflicts")
+        
+    except Exception as e:
+        log_error(f"Error testing keyboard access: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 # ==================== Uninstall Command ====================
 
 def uninstall_command(keep_models: bool = False, remove_permissions: bool = False,
@@ -4073,4 +4389,118 @@ def uninstall_command(keep_models: bool = False, remove_permissions: bool = Fals
         print("Note: System permissions (group memberships, udev rules) were not removed.")
         print("      You may want to remove them manually if needed.")
     print()
+
+
+def record_command(action: str, language: str = None):
+    """
+    Control recording via CLI - useful when keyboard grab is not possible.
+
+    This writes to the recording control FIFO to trigger start/stop/toggle
+    without requiring keyboard grab. Useful for users with:
+    - External hotkey systems (KDE, GNOME, sxhkd, etc.)
+    - Keyboard remappers that grab devices (Espanso, keyd, kmonad)
+    - Multiple keyboard tools that conflict with grab_keys
+
+    Args:
+        action: The action to perform (start, stop, toggle, status)
+        language: Optional language code for transcription (e.g., 'en', 'it', 'de')
+    """
+    import stat
+
+    def is_recording() -> bool:
+        """Check if currently recording (status file exists with 'true')"""
+        if not RECORDING_STATUS_FILE.exists():
+            return False
+        try:
+            content = RECORDING_STATUS_FILE.read_text().strip().lower()
+            return content == 'true'
+        except Exception:
+            return False
+
+    def send_control(command: str) -> bool:
+        """Send a command to the recording control FIFO"""
+        if not RECORDING_CONTROL_FILE.exists():
+            log_error("Recording control file not found.")
+            log_error("Is the hyprwhspr service running?")
+            log_info("Start it with: systemctl --user start hyprwhspr")
+            return False
+
+        # Check if it's a FIFO (named pipe)
+        try:
+            file_stat = RECORDING_CONTROL_FILE.stat()
+            is_fifo = stat.S_ISFIFO(file_stat.st_mode)
+        except Exception:
+            is_fifo = False
+
+        try:
+            if is_fifo:
+                # Open FIFO in non-blocking mode with timeout
+                import select
+                fd = os.open(str(RECORDING_CONTROL_FILE), os.O_WRONLY | os.O_NONBLOCK)
+                fd_closed = False
+                try:
+                    # Wait for FIFO to be ready for writing (service is listening)
+                    _, ready, _ = select.select([], [fd], [], 2.0)
+                    if not ready:
+                        os.close(fd)
+                        fd_closed = True
+                        log_error("Service not responding (timeout waiting for FIFO)")
+                        log_info("The service may be busy or not running properly")
+                        return False
+                    os.write(fd, (command + '\n').encode())
+                finally:
+                    if not fd_closed:
+                        os.close(fd)
+            else:
+                # Fall back to regular file write
+                RECORDING_CONTROL_FILE.write_text(command + '\n')
+            return True
+        except OSError as e:
+            if e.errno == 6:  # ENXIO - no reader on FIFO
+                log_error("Service not listening on control FIFO")
+                log_info("Is the hyprwhspr service running?")
+                log_info("Start it with: systemctl --user start hyprwhspr")
+            else:
+                log_error(f"Failed to send command: {e}")
+            return False
+        except Exception as e:
+            log_error(f"Failed to send command: {e}")
+            return False
+
+    # Build start command with optional language
+    start_cmd = f'start:{language}' if language else 'start'
+
+    if action == 'start':
+        if is_recording():
+            log_warning("Already recording")
+            return
+        if send_control(start_cmd):
+            msg = f"Recording started (language: {language})" if language else "Recording started"
+            log_success(msg)
+
+    elif action == 'stop':
+        if not is_recording():
+            log_warning("Not currently recording")
+            return
+        if send_control('stop'):
+            log_success("Recording stopped")
+
+    elif action == 'toggle':
+        if is_recording():
+            if send_control('stop'):
+                log_success("Recording stopped")
+        else:
+            if send_control(start_cmd):
+                msg = f"Recording started (language: {language})" if language else "Recording started"
+                log_success(msg)
+
+    elif action == 'status':
+        if is_recording():
+            log_info("Status: Recording in progress")
+        else:
+            log_info("Status: Idle")
+
+    else:
+        log_error(f"Unknown action: {action}")
+        log_info("Available actions: start, stop, toggle, status")
 
